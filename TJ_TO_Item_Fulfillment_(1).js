@@ -1,50 +1,6 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
- *
- * Purpose:
- * - Hardcoded TO + WMS order number.
- * - Call Jazz shipment API and get ALL shipments/cartons for the WMS order.
- * - Instead of one Item Fulfillment per carton, build ONE CONSOLIDATED
- *   Item Fulfillment for the whole Transfer Order:
- *      - Cartons are matched ONE AT A TIME (not summed/pooled). For every
- *        item in a carton, we look for an UNUSED TO/IF line with the SAME
- *        SKU and the SAME EXACT QUANTITY. If every item in that carton
- *        finds a match, all of them get fulfilled together and the carton
- *        is added to the "Package" subtab (tracking number + carton number
- *        + weight). If even ONE item in the carton can't find a match, the
- *        WHOLE carton is skipped - nothing in it gets fulfilled, and it is
- *        NOT added to Package - and it's logged clearly with the exact
- *        SKU/quantity that failed to match.
- *      - This correctly handles TOs with duplicate lines for the same SKU
- *        (e.g. 20 lines of the same SKU, each qty 27): each carton claims
- *        one specific line for itself by matching on qty, so nothing gets
- *        double-counted or guessed at.
- * - Skip cancelled / zero shipped qty lines.
- * - Prevent duplicate consolidated IF creation by WMS order number
- *   (since there should only ever be ONE IF for this TO now).
- * - Set Jazz shipment date on trandate, packeddate, shippeddate, pickeddate
- *   (uses the earliest ship date found across all cartons).
- *
- * IMPORTANT:
- * - This script produces exactly ONE input row (the whole order), so it will
- *   create at most ONE Item Fulfillment total. Deployment concurrency does
- *   not matter for correctness here (only one map executes), but leave it
- *   at 1 anyway to be safe.
- *
- * NEW - ITEM RECEIPT STEP:
- * - After the consolidated Item Fulfillment is created and saved, this
- *   script now ALSO transforms the SAME TRANSFER ORDER into ONE
- *   consolidated Item Receipt (record.transform TransferOrd -> ItemRecpt).
- *   NOTE: Item Fulfillment -> Item Receipt is NOT a supported transform
- *   for Transfer Orders in NetSuite - the receipt must be created from
- *   the TO directly, same as the Item Fulfillment was.
- * - NetSuite auto-defaults the Item Receipt's line quantities to whatever
- *   was fulfilled-but-not-yet-received on the TO, so it lines up
- *   automatically with the IF we just created - no separate SKU/qty
- *   matching needed here.
- * - If the receipt fails to create for any reason, it is logged clearly,
- *   but the Item Fulfillment that was already created is NOT rolled back.
  */
 
 define(['N/https', 'N/record', 'N/log', 'N/search'],
@@ -289,14 +245,17 @@ function (https, record, log, search) {
         }
 
         /*********************************************************
-         * MATCH CARTON BY CARTON
+         * MATCH CARTON BY CARTON, ITEM BY ITEM
          * For every item in a carton, find an UNUSED line with the
-         * SAME SKU and the SAME exact quantity. If EVERY item in the
-         * carton finds a match, commit all of them (fulfill those
-         * lines + add this carton to Package). If ANY item in the
-         * carton can't find a match, skip the WHOLE carton - do not
-         * fulfill any of its items, do not add it to Package - and
-         * log exactly which item/qty failed and why.
+         * SAME SKU and the SAME exact quantity.
+         *   - If found: fulfill that line immediately, mark it used.
+         *   - If NOT found: log it and move on to the NEXT ITEM in
+         *     the same carton (does NOT skip the whole carton - the
+         *     carton's other items still get a chance to fulfill).
+         * A carton is only added to the Package subtab if EVERY item
+         * in it found a match. If any item didn't match, the carton
+         * is excluded from Package and logged, but whatever DID
+         * match on that carton is still fulfilled on the IF.
          *********************************************************/
         clearPackageLines(ifRec);
 
@@ -314,9 +273,8 @@ function (https, record, log, search) {
                 continue;
             }
 
-            var tentative = [];        // [{ poolIndex, item }]
-            var reservedThisCarton = {}; // poolIndex -> true (prevents 2 items in same carton grabbing the same line)
-            var failedItem = null;
+            var unmatchedItems = [];
+            var allMatched = true;
 
             for (var ci = 0; ci < cartonItems.length; ci++) {
                 var item = cartonItems[ci];
@@ -326,7 +284,6 @@ function (https, record, log, search) {
                     var poolLine = linePool[pi];
 
                     if (!poolLine.used &&
-                        !reservedThisCarton[pi] &&
                         poolLine.sku === item.sku &&
                         poolLine.availableQty === item.qty) {
                         matchIndex = pi;
@@ -335,39 +292,46 @@ function (https, record, log, search) {
                 }
 
                 if (matchIndex === -1) {
-                    failedItem = item;
-                    break;
+                    // No matching line for this exact SKU + qty. Figure out
+                    // WHY, using whatever cancellation info Jazz gave us,
+                    // so the log tells you something useful instead of
+                    // just "didn't match".
+                    var cancelledQty = Number(item.cancelledQty || 0);
+                    var likelyReason;
+
+                    if (cancelledQty > 0) {
+                        likelyReason = 'Jazz shows ' + cancelledQty + ' unit(s) of this line were CANCELLED, ' +
+                            'which likely explains why the shipped qty (' + item.qty + ') does not exactly ' +
+                            'match any remaining TO line quantity.';
+                    } else {
+                        likelyReason = 'No cancellation info found on this line. Either this SKU does not exist ' +
+                            'on the TO at all, the exact quantity was already claimed by another carton, or ' +
+                            'there is a genuine data mismatch between Jazz and the TO worth investigating manually.';
+                    }
+
+                    log.audit('ITEM NOT FULFILLED - NO MATCHING TO LINE FOUND', {
+                        wmsOrderNumber: row.wmsOrderNumber,
+                        cartonNumber: carton.cartonNumber,
+                        trackingNumber: carton.trackingNumber,
+                        sku: item.sku,
+                        shippedQty: item.qty,
+                        cancelledQtyOnThisLine: cancelledQty,
+                        reason: likelyReason
+                    });
+
+                    unmatchedItems.push({
+                        sku: item.sku,
+                        qty: item.qty,
+                        cancelledQty: cancelledQty,
+                        likelyCancelled: cancelledQty > 0
+                    });
+
+                    allMatched = false;
+                    continue;
                 }
 
-                reservedThisCarton[matchIndex] = true;
-                tentative.push({ poolIndex: matchIndex, item: item });
-            }
-
-            if (failedItem) {
-                log.audit('CARTON SKIPPED - NO MATCHING TO LINE FOUND', {
-                    wmsOrderNumber: row.wmsOrderNumber,
-                    cartonNumber: carton.cartonNumber,
-                    trackingNumber: carton.trackingNumber,
-                    failedSku: failedItem.sku,
-                    failedQty: failedItem.qty,
-                    reason: 'No unused Item Fulfillment line found with this exact SKU + quantity. ' +
-                        'Either it was already claimed by another carton, the TO has no line with this exact quantity, ' +
-                        'or the SKU does not exist on the TO at all.'
-                });
-
-                result.cartonsExcludedFromPackage.push({
-                    cartonNumber: carton.cartonNumber,
-                    failedSku: failedItem.sku,
-                    failedQty: failedItem.qty
-                });
-
-                continue;
-            }
-
-            // All items in this carton matched - commit them
-            for (var t = 0; t < tentative.length; t++) {
-                var poolIdx = tentative[t].poolIndex;
-                var matchedLine = linePool[poolIdx];
+                // Match found - fulfill it immediately
+                var matchedLine = linePool[matchIndex];
 
                 setReceive(ifRec, matchedLine.lineIndex, true);
 
@@ -382,6 +346,23 @@ function (https, record, log, search) {
 
                 result.fulfillLineCount++;
                 result.fulfillQtyTotal += matchedLine.availableQty;
+            }
+
+            if (!allMatched) {
+                log.audit('CARTON EXCLUDED FROM PACKAGE - ONE OR MORE ITEMS DID NOT FULFILL', {
+                    wmsOrderNumber: row.wmsOrderNumber,
+                    cartonNumber: carton.cartonNumber,
+                    trackingNumber: carton.trackingNumber,
+                    unmatchedItems: unmatchedItems,
+                    note: 'Any OTHER items in this carton that DID match were still fulfilled above.'
+                });
+
+                result.cartonsExcludedFromPackage.push({
+                    cartonNumber: carton.cartonNumber,
+                    unmatchedItems: unmatchedItems
+                });
+
+                continue;
             }
 
             addOnePackageLine(ifRec, packageLineIndex, carton.trackingNumber, carton.cartonNumber, carton.weight);
@@ -665,7 +646,18 @@ function (https, record, log, search) {
             for (var d = 0; d < details.length; d++) {
                 var detail = details[d];
 
+                var detailCancelledQty = getDetailCancelledQty(detail);
+
                 if (isCancelledDetail(detail)) {
+                    // NEW: log this instead of silently dropping it, so it's
+                    // clear WHY a SKU never shows up as an item on any carton.
+                    log.audit('JAZZ DETAIL FULLY CANCELLED - EXCLUDED FROM CARTON', {
+                        cartonNumber: getCartonNumber(detail) || getCartonNumber(shipment),
+                        sku: normalizeSku(getDetailSku(detail)),
+                        cancelledQty: detailCancelledQty,
+                        shippedQty: getDetailShippedQty(detail),
+                        rawStatus: detail.status || detail.line_status || detail.cancel_status || ''
+                    });
                     continue;
                 }
 
@@ -711,9 +703,14 @@ function (https, record, log, search) {
                 }
 
                 // --- Track this carton's own SKU/qty (per-carton, NOT summed) ---
+                // cancelledQty is kept here too (partial cancellation: some
+                // units of this same line were cancelled in Jazz while the
+                // rest still shipped - this explains why the shipped qty may
+                // not exactly match the TO line's original ordered quantity).
                 cartonMap[cartonNumber].items.push({
                     sku: sku,
-                    qty: qty
+                    qty: qty,
+                    cancelledQty: detailCancelledQty
                 });
 
                 // --- Sum item qty by SKU across ALL cartons ---
@@ -830,6 +827,15 @@ function (https, record, log, search) {
         }
 
         return Number(qty || 0);
+    }
+
+    function getDetailCancelledQty(detail) {
+        return Number(
+            detail.qty_cancelled ||
+            detail.cancelled_qty ||
+            detail.quantity_cancelled ||
+            0
+        );
     }
 
     function getShipmentNumber(shipment) {
