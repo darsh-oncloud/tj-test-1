@@ -7,10 +7,19 @@
  * - Call Jazz shipment API and get ALL shipments/cartons for the WMS order.
  * - Instead of one Item Fulfillment per carton, build ONE CONSOLIDATED
  *   Item Fulfillment for the whole Transfer Order:
- *      - All cartons are added as separate lines on the "Package" subtab
- *        (tracking number + carton number + weight per carton).
- *      - All Jazz item quantities are SUMMED BY SKU across every carton,
- *        then matched/fulfilled against the TO lines on the single IF.
+ *      - Cartons are matched ONE AT A TIME (not summed/pooled). For every
+ *        item in a carton, we look for an UNUSED TO/IF line with the SAME
+ *        SKU and the SAME EXACT QUANTITY. If every item in that carton
+ *        finds a match, all of them get fulfilled together and the carton
+ *        is added to the "Package" subtab (tracking number + carton number
+ *        + weight). If even ONE item in the carton can't find a match, the
+ *        WHOLE carton is skipped - nothing in it gets fulfilled, and it is
+ *        NOT added to Package - and it's logged clearly with the exact
+ *        SKU/quantity that failed to match.
+ *      - This correctly handles TOs with duplicate lines for the same SKU
+ *        (e.g. 20 lines of the same SKU, each qty 27): each carton claims
+ *        one specific line for itself by matching on qty, so nothing gets
+ *        double-counted or guessed at.
  * - Skip cancelled / zero shipped qty lines.
  * - Prevent duplicate consolidated IF creation by WMS order number
  *   (since there should only ever be ONE IF for this TO now).
@@ -249,12 +258,9 @@ function (https, record, log, search) {
         trySet(ifRec, BODY_JAZZ_SHIPMENT_NUMBER, row.primaryShipmentNumber);
 
         /*********************************************************
-         * MATCH JAZZ SKU (SUMMED ACROSS ALL CARTONS) TO IF LINES
-         * (Package lines are added AFTER this, once we know which
-         * SKUs came up short - see below.)
+         * BUILD POOL OF AVAILABLE IF LINES
+         * Each entry: { lineIndex, sku, availableQty, used }
          *********************************************************/
-        var remainingBySku = copyObj(requiredQtyBySku);
-
         var lineCount = ifRec.getLineCount({
             sublistId: 'item'
         });
@@ -264,115 +270,124 @@ function (https, record, log, search) {
             setReceive(ifRec, i, false);
         }
 
-        for (var line = 0; line < lineCount; line++) {
-            var lineSku = getLineSku(ifRec, line);
-            var lineAvailableQty = getLineAvailableQty(ifRec, line);
-            var jazzRemainingQty = Number(remainingBySku[lineSku] || 0);
+        var linePool = [];
 
-            if (!lineSku || jazzRemainingQty <= 0 || lineAvailableQty <= 0) {
+        for (var li = 0; li < lineCount; li++) {
+            var poolSku = getLineSku(ifRec, li);
+            var poolQty = getLineAvailableQty(ifRec, li);
+
+            if (poolSku && poolQty > 0) {
+                linePool.push({
+                    lineIndex: li,
+                    sku: poolSku,
+                    availableQty: poolQty,
+                    used: false
+                });
+            } else {
                 result.skippedLineCount++;
-                continue;
-            }
-
-            var qtyToFulfill = Math.min(jazzRemainingQty, lineAvailableQty);
-
-            if (qtyToFulfill <= 0) {
-                result.skippedLineCount++;
-                continue;
-            }
-
-            setReceive(ifRec, line, true);
-
-            ifRec.setSublistValue({
-                sublistId: 'item',
-                fieldId: 'quantity',
-                line: line,
-                value: qtyToFulfill
-            });
-
-            remainingBySku[lineSku] = jazzRemainingQty - qtyToFulfill;
-
-            result.fulfillLineCount++;
-            result.fulfillQtyTotal += qtyToFulfill;
-        }
-
-        /*********************************************************
-         * COLLECT UNMATCHED JAZZ SKU/QTY
-         * (remainingBySku now holds, per SKU, how much Jazz shipped
-         * that COULD NOT be fulfilled anywhere on the IF.)
-         *********************************************************/
-        var shortfallSkus = {}; // SKU -> remaining qty not fulfilled
-
-        for (var sku in remainingBySku) {
-            if (remainingBySku.hasOwnProperty(sku)) {
-                var remainingQty = Number(remainingBySku[sku] || 0);
-
-                if (remainingQty > 0) {
-                    shortfallSkus[sku] = remainingQty;
-
-                    result.unmatchedJazzSkus.push({
-                        sku: sku,
-                        remainingQtyNotMatched: remainingQty
-                    });
-                }
             }
         }
 
         /*********************************************************
-         * PACKAGE LINES
-         * Only add a carton to the Package subtab if EVERY item in
-         * that carton was fully fulfilled (i.e. none of its SKUs
-         * are in shortfallSkus). If a carton contains ANY SKU that
-         * came up short anywhere on the order, we can't be sure this
-         * exact carton's units were the ones that fulfilled vs the
-         * ones left over (quantities are pooled across cartons), so
-         * to be safe we EXCLUDE that carton from Package and log it
-         * clearly instead of guessing.
+         * MATCH CARTON BY CARTON
+         * For every item in a carton, find an UNUSED line with the
+         * SAME SKU and the SAME exact quantity. If EVERY item in the
+         * carton finds a match, commit all of them (fulfill those
+         * lines + add this carton to Package). If ANY item in the
+         * carton can't find a match, skip the WHOLE carton - do not
+         * fulfill any of its items, do not add it to Package - and
+         * log exactly which item/qty failed and why.
          *********************************************************/
         clearPackageLines(ifRec);
 
         result.packageLinesAdded = 0;
         result.cartonsExcludedFromPackage = [];
+        result.cartonsFulfilled = [];
 
         var packageLineIndex = 0;
 
         for (var c = 0; c < row.cartons.length; c++) {
             var carton = row.cartons[c];
             var cartonItems = carton.items || [];
-            var cartonShortfalls = [];
 
-            for (var ci = 0; ci < cartonItems.length; ci++) {
-                var itemSku = cartonItems[ci].sku;
-
-                if (shortfallSkus.hasOwnProperty(itemSku)) {
-                    cartonShortfalls.push({
-                        sku: itemSku,
-                        cartonQty: cartonItems[ci].qty,
-                        totalRemainingNotFulfilledForThisSku: shortfallSkus[itemSku]
-                    });
-                }
+            if (cartonItems.length === 0) {
+                continue;
             }
 
-            if (cartonShortfalls.length > 0) {
-                log.audit('CARTON EXCLUDED FROM PACKAGE - ITEM NOT FULLY FULFILLED', {
+            var tentative = [];        // [{ poolIndex, item }]
+            var reservedThisCarton = {}; // poolIndex -> true (prevents 2 items in same carton grabbing the same line)
+            var failedItem = null;
+
+            for (var ci = 0; ci < cartonItems.length; ci++) {
+                var item = cartonItems[ci];
+                var matchIndex = -1;
+
+                for (var pi = 0; pi < linePool.length; pi++) {
+                    var poolLine = linePool[pi];
+
+                    if (!poolLine.used &&
+                        !reservedThisCarton[pi] &&
+                        poolLine.sku === item.sku &&
+                        poolLine.availableQty === item.qty) {
+                        matchIndex = pi;
+                        break;
+                    }
+                }
+
+                if (matchIndex === -1) {
+                    failedItem = item;
+                    break;
+                }
+
+                reservedThisCarton[matchIndex] = true;
+                tentative.push({ poolIndex: matchIndex, item: item });
+            }
+
+            if (failedItem) {
+                log.audit('CARTON SKIPPED - NO MATCHING TO LINE FOUND', {
                     wmsOrderNumber: row.wmsOrderNumber,
                     cartonNumber: carton.cartonNumber,
                     trackingNumber: carton.trackingNumber,
-                    reason: 'One or more SKUs in this carton were not fully fulfilled on the Item Fulfillment.',
-                    affectedSkus: cartonShortfalls
+                    failedSku: failedItem.sku,
+                    failedQty: failedItem.qty,
+                    reason: 'No unused Item Fulfillment line found with this exact SKU + quantity. ' +
+                        'Either it was already claimed by another carton, the TO has no line with this exact quantity, ' +
+                        'or the SKU does not exist on the TO at all.'
                 });
 
                 result.cartonsExcludedFromPackage.push({
                     cartonNumber: carton.cartonNumber,
-                    affectedSkus: cartonShortfalls
+                    failedSku: failedItem.sku,
+                    failedQty: failedItem.qty
                 });
 
                 continue;
             }
 
+            // All items in this carton matched - commit them
+            for (var t = 0; t < tentative.length; t++) {
+                var poolIdx = tentative[t].poolIndex;
+                var matchedLine = linePool[poolIdx];
+
+                setReceive(ifRec, matchedLine.lineIndex, true);
+
+                ifRec.setSublistValue({
+                    sublistId: 'item',
+                    fieldId: 'quantity',
+                    line: matchedLine.lineIndex,
+                    value: matchedLine.availableQty
+                });
+
+                matchedLine.used = true;
+
+                result.fulfillLineCount++;
+                result.fulfillQtyTotal += matchedLine.availableQty;
+            }
+
             addOnePackageLine(ifRec, packageLineIndex, carton.trackingNumber, carton.cartonNumber, carton.weight);
             packageLineIndex++;
             result.packageLinesAdded++;
+            result.cartonsFulfilled.push(carton.cartonNumber);
         }
 
         log.audit('PACKAGE LINES ADDED', {
