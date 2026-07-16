@@ -25,10 +25,15 @@
  *
  * NEW - ITEM RECEIPT STEP:
  * - After the consolidated Item Fulfillment is created and saved, this
- *   script now ALSO transforms that same Item Fulfillment into ONE
- *   consolidated Item Receipt (record.transform ItemShip -> ItemRecpt).
- * - The receipt picks up whatever the IF actually fulfilled, so it stays
- *   consistent automatically - no separate SKU/qty matching needed here.
+ *   script now ALSO transforms the SAME TRANSFER ORDER into ONE
+ *   consolidated Item Receipt (record.transform TransferOrd -> ItemRecpt).
+ *   NOTE: Item Fulfillment -> Item Receipt is NOT a supported transform
+ *   for Transfer Orders in NetSuite - the receipt must be created from
+ *   the TO directly, same as the Item Fulfillment was.
+ * - NetSuite auto-defaults the Item Receipt's line quantities to whatever
+ *   was fulfilled-but-not-yet-received on the TO, so it lines up
+ *   automatically with the IF we just created - no separate SKU/qty
+ *   matching needed here.
  * - If the receipt fails to create for any reason, it is logged clearly,
  *   but the Item Fulfillment that was already created is NOT rolled back.
  */
@@ -133,7 +138,7 @@ function (https, record, log, search) {
                  * NEW: Create ONE consolidated Item Receipt from the
                  * Item Fulfillment we just created.
                  *****************************************************/
-                var receiptResult = createConsolidatedItemReceipt(result.itemFulfillmentId, row);
+                var receiptResult = createConsolidatedItemReceipt(row, result.itemFulfillmentId);
 
                 log.audit('CONSOLIDATED ITEM RECEIPT RESULT', receiptResult);
 
@@ -244,23 +249,9 @@ function (https, record, log, search) {
         trySet(ifRec, BODY_JAZZ_SHIPMENT_NUMBER, row.primaryShipmentNumber);
 
         /*********************************************************
-         * PACKAGE LINES
-         * One line per carton: tracking number, carton number (descr), weight
-         *********************************************************/
-        clearPackageLines(ifRec);
-
-        for (var c = 0; c < row.cartons.length; c++) {
-            var carton = row.cartons[c];
-            addOnePackageLine(ifRec, c, carton.trackingNumber, carton.cartonNumber, carton.weight);
-        }
-
-        log.audit('PACKAGE LINES ADDED', {
-            wmsOrderNumber: row.wmsOrderNumber,
-            totalPackageLinesAdded: row.cartons.length
-        });
-
-        /*********************************************************
          * MATCH JAZZ SKU (SUMMED ACROSS ALL CARTONS) TO IF LINES
+         * (Package lines are added AFTER this, once we know which
+         * SKUs came up short - see below.)
          *********************************************************/
         var remainingBySku = copyObj(requiredQtyBySku);
 
@@ -307,12 +298,18 @@ function (https, record, log, search) {
 
         /*********************************************************
          * COLLECT UNMATCHED JAZZ SKU/QTY
+         * (remainingBySku now holds, per SKU, how much Jazz shipped
+         * that COULD NOT be fulfilled anywhere on the IF.)
          *********************************************************/
+        var shortfallSkus = {}; // SKU -> remaining qty not fulfilled
+
         for (var sku in remainingBySku) {
             if (remainingBySku.hasOwnProperty(sku)) {
                 var remainingQty = Number(remainingBySku[sku] || 0);
 
                 if (remainingQty > 0) {
+                    shortfallSkus[sku] = remainingQty;
+
                     result.unmatchedJazzSkus.push({
                         sku: sku,
                         remainingQtyNotMatched: remainingQty
@@ -320,6 +317,70 @@ function (https, record, log, search) {
                 }
             }
         }
+
+        /*********************************************************
+         * PACKAGE LINES
+         * Only add a carton to the Package subtab if EVERY item in
+         * that carton was fully fulfilled (i.e. none of its SKUs
+         * are in shortfallSkus). If a carton contains ANY SKU that
+         * came up short anywhere on the order, we can't be sure this
+         * exact carton's units were the ones that fulfilled vs the
+         * ones left over (quantities are pooled across cartons), so
+         * to be safe we EXCLUDE that carton from Package and log it
+         * clearly instead of guessing.
+         *********************************************************/
+        clearPackageLines(ifRec);
+
+        result.packageLinesAdded = 0;
+        result.cartonsExcludedFromPackage = [];
+
+        var packageLineIndex = 0;
+
+        for (var c = 0; c < row.cartons.length; c++) {
+            var carton = row.cartons[c];
+            var cartonItems = carton.items || [];
+            var cartonShortfalls = [];
+
+            for (var ci = 0; ci < cartonItems.length; ci++) {
+                var itemSku = cartonItems[ci].sku;
+
+                if (shortfallSkus.hasOwnProperty(itemSku)) {
+                    cartonShortfalls.push({
+                        sku: itemSku,
+                        cartonQty: cartonItems[ci].qty,
+                        totalRemainingNotFulfilledForThisSku: shortfallSkus[itemSku]
+                    });
+                }
+            }
+
+            if (cartonShortfalls.length > 0) {
+                log.audit('CARTON EXCLUDED FROM PACKAGE - ITEM NOT FULLY FULFILLED', {
+                    wmsOrderNumber: row.wmsOrderNumber,
+                    cartonNumber: carton.cartonNumber,
+                    trackingNumber: carton.trackingNumber,
+                    reason: 'One or more SKUs in this carton were not fully fulfilled on the Item Fulfillment.',
+                    affectedSkus: cartonShortfalls
+                });
+
+                result.cartonsExcludedFromPackage.push({
+                    cartonNumber: carton.cartonNumber,
+                    affectedSkus: cartonShortfalls
+                });
+
+                continue;
+            }
+
+            addOnePackageLine(ifRec, packageLineIndex, carton.trackingNumber, carton.cartonNumber, carton.weight);
+            packageLineIndex++;
+            result.packageLinesAdded++;
+        }
+
+        log.audit('PACKAGE LINES ADDED', {
+            wmsOrderNumber: row.wmsOrderNumber,
+            totalCartonsFound: row.cartons.length,
+            packageLinesAdded: result.packageLinesAdded,
+            cartonsExcluded: result.cartonsExcludedFromPackage.length
+        });
 
         if (result.fulfillLineCount <= 0) {
             result.message = 'Skipped - no matching available TO lines for any Jazz SKU.';
@@ -339,15 +400,18 @@ function (https, record, log, search) {
     }
 
     /*************************************************************
-     * NEW: CREATE ONE CONSOLIDATED ITEM RECEIPT FROM THE ITEM FULFILLMENT
-     * - Simple transform: Item Fulfillment -> Item Receipt
-     * - NetSuite auto-populates the receipt lines/quantities from
-     *   whatever the Item Fulfillment actually fulfilled, so no
-     *   separate SKU/qty matching is needed here.
-     * - Logs clearly if line counts don't match or if save fails,
-     *   so nothing is silently missing.
+     * NEW: CREATE ONE CONSOLIDATED ITEM RECEIPT
+     * - NetSuite does NOT allow Item Fulfillment -> Item Receipt
+     *   transform for Transfer Orders. The correct/only supported
+     *   transform is TRANSFER ORDER -> ITEM RECEIPT directly
+     *   (same as how the Item Fulfillment itself was created from
+     *   the TO). NetSuite auto-defaults the receipt's line quantities
+     *   to whatever was fulfilled-but-not-yet-received on that TO,
+     *   so no separate SKU/qty matching is needed here - it will
+     *   automatically line up with the Item Fulfillment we just saved.
+     * - itemFulfillmentId is only passed in for logging/traceability.
      *************************************************************/
-    function createConsolidatedItemReceipt(itemFulfillmentId, row) {
+    function createConsolidatedItemReceipt(row, itemFulfillmentId) {
         var result = {
             success: false,
             itemReceiptId: '',
@@ -355,15 +419,15 @@ function (https, record, log, search) {
             message: ''
         };
 
-        if (!itemFulfillmentId) {
-            result.message = 'Skipped - no Item Fulfillment ID provided.';
+        if (!row || !row.toId) {
+            result.message = 'Skipped - no Transfer Order ID provided.';
             return result;
         }
 
         try {
             var irRec = record.transform({
-                fromType: record.Type.ITEM_FULFILLMENT,
-                fromId: itemFulfillmentId,
+                fromType: record.Type.TRANSFER_ORDER,
+                fromId: row.toId,
                 toType: record.Type.ITEM_RECEIPT,
                 isDynamic: false
             });
@@ -376,13 +440,16 @@ function (https, record, log, search) {
 
             if (lineCount <= 0) {
                 log.error('ITEM RECEIPT - NO LINES FOUND AFTER TRANSFORM', {
+                    toId: row.toId,
                     itemFulfillmentId: itemFulfillmentId,
                     wmsOrderNumber: row.wmsOrderNumber
                 });
 
-                result.message = 'Skipped - transformed Item Receipt has 0 lines.';
+                result.message = 'Skipped - transformed Item Receipt has 0 lines. Nothing outstanding to receive from the TO - check if the Item Fulfillment actually saved with quantities.';
                 return result;
             }
+
+            trySet(irRec, BODY_WMS_ORDER_NUMBER, row.wmsOrderNumber);
 
             var irId = irRec.save({
                 enableSourcing: false,
@@ -391,10 +458,11 @@ function (https, record, log, search) {
 
             result.success = true;
             result.itemReceiptId = irId;
-            result.message = 'Consolidated Item Receipt created successfully.';
+            result.message = 'Consolidated Item Receipt created successfully from the Transfer Order.';
 
         } catch (e) {
             log.error('ITEM RECEIPT CREATE FAILED', {
+                toId: row.toId,
                 itemFulfillmentId: itemFulfillmentId,
                 wmsOrderNumber: row.wmsOrderNumber,
                 message: e.message,
@@ -612,7 +680,8 @@ function (https, record, log, search) {
                         cartonNumber: cartonNumber,
                         trackingNumber: trackingNumber,
                         weight: weight,
-                        shipDate: finalShipDate
+                        shipDate: finalShipDate,
+                        items: []
                     };
                 } else {
                     if (!cartonMap[cartonNumber].trackingNumber && trackingNumber) {
@@ -625,6 +694,12 @@ function (https, record, log, search) {
                         cartonMap[cartonNumber].shipDate = finalShipDate;
                     }
                 }
+
+                // --- Track this carton's own SKU/qty (per-carton, NOT summed) ---
+                cartonMap[cartonNumber].items.push({
+                    sku: sku,
+                    qty: qty
+                });
 
                 // --- Sum item qty by SKU across ALL cartons ---
                 if (!requiredQtyBySku[sku]) {
