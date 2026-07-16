@@ -22,6 +22,15 @@
  *   create at most ONE Item Fulfillment total. Deployment concurrency does
  *   not matter for correctness here (only one map executes), but leave it
  *   at 1 anyway to be safe.
+ *
+ * NEW - ITEM RECEIPT STEP:
+ * - After the consolidated Item Fulfillment is created and saved, this
+ *   script now ALSO transforms that same Item Fulfillment into ONE
+ *   consolidated Item Receipt (record.transform ItemShip -> ItemRecpt).
+ * - The receipt picks up whatever the IF actually fulfilled, so it stays
+ *   consistent automatically - no separate SKU/qty matching needed here.
+ * - If the receipt fails to create for any reason, it is logged clearly,
+ *   but the Item Fulfillment that was already created is NOT rolled back.
  */
 
 define(['N/https', 'N/record', 'N/log', 'N/search'],
@@ -119,8 +128,28 @@ function (https, record, log, search) {
             log.audit('CONSOLIDATED FULFILLMENT RESULT', result);
 
             if (result.success) {
+
+                /*****************************************************
+                 * NEW: Create ONE consolidated Item Receipt from the
+                 * Item Fulfillment we just created.
+                 *****************************************************/
+                var receiptResult = createConsolidatedItemReceipt(result.itemFulfillmentId, row);
+
+                log.audit('CONSOLIDATED ITEM RECEIPT RESULT', receiptResult);
+
+                result.itemReceiptId = receiptResult.itemReceiptId;
+                result.itemReceiptMessage = receiptResult.message;
+
+                if (!receiptResult.success) {
+                    log.error('ITEM RECEIPT FAILED - IF ALREADY CREATED', {
+                        wmsOrderNumber: row.wmsOrderNumber,
+                        itemFulfillmentId: result.itemFulfillmentId,
+                        reason: receiptResult.message
+                    });
+                }
+
                 context.write({
-                    key: 'CREATED',
+                    key: receiptResult.success ? 'CREATED' : 'CREATED_IF_ONLY_RECEIPT_FAILED',
                     value: JSON.stringify(result)
                 });
             } else {
@@ -305,6 +334,75 @@ function (https, record, log, search) {
         result.success = true;
         result.itemFulfillmentId = ifId;
         result.message = 'Consolidated Item Fulfillment created successfully for all cartons.';
+
+        return result;
+    }
+
+    /*************************************************************
+     * NEW: CREATE ONE CONSOLIDATED ITEM RECEIPT FROM THE ITEM FULFILLMENT
+     * - Simple transform: Item Fulfillment -> Item Receipt
+     * - NetSuite auto-populates the receipt lines/quantities from
+     *   whatever the Item Fulfillment actually fulfilled, so no
+     *   separate SKU/qty matching is needed here.
+     * - Logs clearly if line counts don't match or if save fails,
+     *   so nothing is silently missing.
+     *************************************************************/
+    function createConsolidatedItemReceipt(itemFulfillmentId, row) {
+        var result = {
+            success: false,
+            itemReceiptId: '',
+            lineCount: 0,
+            message: ''
+        };
+
+        if (!itemFulfillmentId) {
+            result.message = 'Skipped - no Item Fulfillment ID provided.';
+            return result;
+        }
+
+        try {
+            var irRec = record.transform({
+                fromType: record.Type.ITEM_FULFILLMENT,
+                fromId: itemFulfillmentId,
+                toType: record.Type.ITEM_RECEIPT,
+                isDynamic: false
+            });
+
+            var lineCount = irRec.getLineCount({
+                sublistId: 'item'
+            });
+
+            result.lineCount = lineCount;
+
+            if (lineCount <= 0) {
+                log.error('ITEM RECEIPT - NO LINES FOUND AFTER TRANSFORM', {
+                    itemFulfillmentId: itemFulfillmentId,
+                    wmsOrderNumber: row.wmsOrderNumber
+                });
+
+                result.message = 'Skipped - transformed Item Receipt has 0 lines.';
+                return result;
+            }
+
+            var irId = irRec.save({
+                enableSourcing: false,
+                ignoreMandatoryFields: true
+            });
+
+            result.success = true;
+            result.itemReceiptId = irId;
+            result.message = 'Consolidated Item Receipt created successfully.';
+
+        } catch (e) {
+            log.error('ITEM RECEIPT CREATE FAILED', {
+                itemFulfillmentId: itemFulfillmentId,
+                wmsOrderNumber: row.wmsOrderNumber,
+                message: e.message,
+                stack: e.stack
+            });
+
+            result.message = 'Error creating Item Receipt: ' + e.message;
+        }
 
         return result;
     }
@@ -946,6 +1044,7 @@ function (https, record, log, search) {
      *************************************************************/
     function summarize(summary) {
         var created = 0;
+        var createdIfOnlyReceiptFailed = 0;
         var skipped = 0;
         var duplicateSkipped = 0;
         var errors = 0;
@@ -953,6 +1052,8 @@ function (https, record, log, search) {
         summary.output.iterator().each(function (key, value) {
             if (key === 'CREATED') {
                 created++;
+            } else if (key === 'CREATED_IF_ONLY_RECEIPT_FAILED') {
+                createdIfOnlyReceiptFailed++;
             } else if (key === 'SKIPPED') {
                 skipped++;
             } else if (key === 'DUPLICATE_SKIPPED') {
@@ -969,10 +1070,18 @@ function (https, record, log, search) {
             concurrency: summary.concurrency,
             yields: summary.yields,
             created: created,
+            createdIfOnlyReceiptFailed: createdIfOnlyReceiptFailed,
             skipped: skipped,
             duplicateSkipped: duplicateSkipped,
             errors: errors
         });
+
+        if (createdIfOnlyReceiptFailed > 0) {
+            log.error('ATTENTION - ITEM FULFILLMENT(S) CREATED WITHOUT A RECEIPT', {
+                count: createdIfOnlyReceiptFailed,
+                note: 'Check ITEM RECEIPT FAILED entries above for the reason and create the receipt manually if needed.'
+            });
+        }
 
         summary.mapSummary.errors.iterator().each(function (key, error) {
             log.error('MAP SUMMARY ERROR ' + key, error);
