@@ -1,49 +1,6 @@
 /**
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
- *
- * TRANSFER ORDER -> ONE CONSOLIDATED ITEM FULFILLMENT + ONE ITEM RECEIPT
- * Source of truth for quantities: Jazz OMS shipment API.
- *
- * ---------------------------------------------------------------------------
- * HOW QUANTITIES ARE DECIDED (this is the important part)
- * ---------------------------------------------------------------------------
- * 1. Pull EVERY shipment/carton from Jazz for the WMS order number.
- * 2. SUM shipped qty BY SKU across all cartons  -> shippedQtyBySku
- *    SUM cancelled qty BY SKU across all cartons -> cancelledQtyBySku
- * 3. Transform TO -> Item Fulfillment. Uncheck every line.
- * 4. Walk the IF lines in order. For each line whose SKU still has Jazz qty
- *    left to allocate, fulfil min(jazzRemaining, lineAvailable).
- *    A SKU spread over several TO lines fills top-down until Jazz qty is gone.
- *    There is NO carton-by-carton validation - quantities are pooled.
- * 5. Whatever does not reconcile goes in the MEMO (see below).
- * 6. ALL cartons are written to the Package subtab regardless of shortfalls.
- *
- * ---------------------------------------------------------------------------
- * MEMO FORMAT (capped at 999 chars, NetSuite body memo limit)
- * ---------------------------------------------------------------------------
- *   CANCELLED(JAZZ): SKU x5, SKU x2 || SHORT(NOT SHIPPED): SKU x90 ||
- *   EXTRA(JAZZ>TO): SKU x3
- *
- *   CANCELLED(JAZZ) - qty Jazz reported cancelled on the order.
- *   SHORT(NOT SHIPPED) - on the TO / available to fulfil, but Jazz never
- *                        shipped it. (4000 ordered vs 390 shipped lands here.)
- *   EXTRA(JAZZ>TO)     - Jazz shipped more than the TO had available, or the
- *                        SKU is not on the TO at all ([NOT-ON-TO] tag).
- *
- * Full untruncated detail is always written to the execution log even when the
- * memo is truncated. Look for the RECONCILIATION DETAIL audit entry.
- *
- * ---------------------------------------------------------------------------
- * NOTES / GOTCHAS
- * ---------------------------------------------------------------------------
- * - IF -> Item Receipt is NOT a supported transform for Transfer Orders. The
- *   receipt must be created from the TO directly. NetSuite defaults the receipt
- *   lines to fulfilled-but-not-yet-received, so it lines up with the IF
- *   automatically. No second round of SKU matching needed.
- * - If the receipt fails, the IF is NOT rolled back. It is logged loudly.
- * - Lot / serial numbered items would need inventorydetail populated on the IF
- *   lines. This script does not do that - add it if your items are tracked.
  */
 
 define(['N/https', 'N/record', 'N/log', 'N/search'],
@@ -67,15 +24,18 @@ function (https, record, log, search) {
         JAZZ_MAX_PAGES:  100
     };
 
+    // Set false once you are happy the cancel data is coming through.
+    var DEBUG_JAZZ_FIELDS = true;
+
     /*************************************************************
      * FIELD IDS
      *************************************************************/
     var LINE_SKU_FIELD = 'custcol_sku_external_id';
 
-    var BODY_WMS_ORDER_NUMBER    = 'custbody_wms_order_number';
-    var BODY_TRACKING_NUMBER     = 'custbody_mtracking';
-    var BODY_TOTAL_QTY_SHIPPED   = 'custbody_total_qty_shipped';
-    var BODY_NO_CARTONS          = 'custbody_no_cartons';
+    var BODY_WMS_ORDER_NUMBER     = 'custbody_wms_order_number';
+    var BODY_TRACKING_NUMBER      = 'custbody_mtracking';
+    var BODY_TOTAL_QTY_SHIPPED    = 'custbody_total_qty_shipped';
+    var BODY_NO_CARTONS           = 'custbody_no_cartons';
     var BODY_JAZZ_SHIPMENT_NUMBER = 'custbody_jazz_shipment_number';
 
     var MAX_MEMO_LENGTH = 999;
@@ -90,40 +50,56 @@ function (https, record, log, search) {
             wmsOrderNumber: CONFIG.WMS_ORDER_NUMBER
         });
 
-        var token     = getJazzToken();
-        var shipments = getAllJazzShipments(token, CONFIG.WMS_ORDER_NUMBER);
+        var token = getJazzToken();
 
-        var jazz = summariseJazzShipments(shipments);
+        // 1. Shipments -> what shipped, per carton
+        var shipments = getAllJazzShipments(token, CONFIG.WMS_ORDER_NUMBER);
+        var jazzShip  = summariseJazzShipments(shipments);
+
+        // 2. Order -> what was ordered / cancelled, per line
+        var orders    = getAllJazzOrders(token, CONFIG.WMS_ORDER_NUMBER);
+        var jazzOrder = summariseJazzOrders(orders);
+
+        // 3. NetSuite TO totals
         var toQtyBySku = getToQtyBySku(CONFIG.TO_ID);
 
         var row = {
-            toId:            CONFIG.TO_ID,
-            wmsOrderNumber:  CONFIG.WMS_ORDER_NUMBER,
+            toId:           CONFIG.TO_ID,
+            wmsOrderNumber: CONFIG.WMS_ORDER_NUMBER,
 
-            cartons:            jazz.cartons,
-            shippedQtyBySku:    jazz.shippedQtyBySku,
-            cancelledQtyBySku:  jazz.cancelledQtyBySku,
-            totalShippedQty:    jazz.totalShippedQty,
-            totalCancelledQty:  jazz.totalCancelledQty,
+            cartons:         jazzShip.cartons,
+            shippedQtyBySku: jazzShip.shippedQtyBySku,
+            totalShippedQty: jazzShip.totalShippedQty,
 
-            toQtyBySku:      toQtyBySku,
+            cancelledQtyBySku: jazzOrder.cancelledQtyBySku,
+            totalCancelledQty: jazzOrder.totalCancelledQty,
+            orderedQtyBySku:   jazzOrder.orderedQtyBySku,
+            totalOrderedQty:   jazzOrder.totalOrderedQty,
+            jazzOrderStatus:   jazzOrder.statuses.join(','),
 
-            primaryTrackingNumber: jazz.primaryTrackingNumber,
-            primaryShipmentNumber: jazz.primaryShipmentNumber,
-            earliestShipDate:      jazz.earliestShipDate
+            toQtyBySku: toQtyBySku,
+
+            primaryTrackingNumber: jazzShip.primaryTrackingNumber,
+            primaryShipmentNumber: jazzShip.primaryShipmentNumber,
+            earliestShipDate:      jazzShip.earliestShipDate
         };
 
         log.audit('INPUT SUMMARY', {
             shipmentsFromJazz:  shipments.length,
-            cartonsFound:       jazz.cartons.length,
-            distinctShippedSku: Object.keys(jazz.shippedQtyBySku).length,
-            totalShippedQty:    jazz.totalShippedQty,
-            distinctCancelSku:  Object.keys(jazz.cancelledQtyBySku).length,
-            totalCancelledQty:  jazz.totalCancelledQty,
-            distinctToSku:      Object.keys(toQtyBySku).length
+            cartonsFound:       jazzShip.cartons.length,
+            distinctShippedSku: Object.keys(jazzShip.shippedQtyBySku).length,
+            totalShippedQty:    jazzShip.totalShippedQty,
+
+            orderRecordsFromJazz: orders.length,
+            jazzOrderStatus:      row.jazzOrderStatus,
+            totalOrderedQty:      jazzOrder.totalOrderedQty,
+            distinctCancelSku:    Object.keys(jazzOrder.cancelledQtyBySku).length,
+            totalCancelledQty:    jazzOrder.totalCancelledQty,
+
+            distinctToSku: Object.keys(toQtyBySku).length
         });
 
-        // Exactly one row -> exactly one map execution -> at most one IF.
+        // Exactly one row -> one map execution -> at most one IF.
         return [row];
     }
 
@@ -284,19 +260,22 @@ function (https, record, log, search) {
         var memo  = buildMemoString(recon);
 
         result.reconciliation = {
-            cancelledCount:  recon.cancelled.length,
-            shortCount:      recon.short.length,
-            extraCount:      recon.extra.length,
-            cancelledQty:    sumBucket(recon.cancelled),
-            shortQty:        sumBucket(recon.short),
-            extraQty:        sumBucket(recon.extra)
+            cancelledCount: recon.cancelled.length,
+            shortCount:     recon.short.length,
+            extraCount:     recon.extra.length,
+            cancelledQty:   sumBucket(recon.cancelled),
+            shortQty:       sumBucket(recon.short),
+            extraQty:       sumBucket(recon.extra)
         };
         result.memo          = memo.text;
         result.memoTruncated = memo.truncated;
 
-        // Full detail always lands in the log, even when the memo is clipped.
         log.audit('RECONCILIATION DETAIL', {
             wmsOrderNumber: row.wmsOrderNumber,
+            jazzTotalShipped:   row.totalShippedQty,
+            jazzTotalCancelled: row.totalCancelledQty,
+            jazzTotalOrdered:   row.totalOrderedQty,
+            netsuiteFulfilled:  alloc.fulfilledQtyTotal,
             cancelledInJazz: recon.cancelled,
             shortNotShipped: recon.short,
             extraJazzOverTo: recon.extra
@@ -311,8 +290,7 @@ function (https, record, log, search) {
         clearPackageLines(ifRec);
 
         for (var c = 0; c < row.cartons.length; c++) {
-            var carton = row.cartons[c];
-            if (addOnePackageLine(ifRec, result.packageLinesAdded, carton)) {
+            if (addOnePackageLine(ifRec, result.packageLinesAdded, row.cartons[c])) {
                 result.packageLinesAdded++;
             }
         }
@@ -338,7 +316,6 @@ function (https, record, log, search) {
 
     /**
      * Uncheck every line, then walk lines in order allocating pooled Jazz qty.
-     * Returns the allocation outcome plus everything needed to reconcile.
      */
     function allocateQuantities(ifRec, shippedQtyBySku) {
         var out = {
@@ -399,8 +376,8 @@ function (https, record, log, search) {
     }
 
     /**
-     * Three buckets:
-     *   cancelled - Jazz reported cancelled qty
+     * Three memo buckets:
+     *   cancelled - Jazz order/status qty_canceled
      *   short     - available on the IF but Jazz never shipped it
      *   extra     - Jazz shipped more than the IF could take, or SKU not on TO
      */
@@ -417,8 +394,14 @@ function (https, record, log, search) {
             if (!cancelledQtyBySku.hasOwnProperty(sku)) continue;
 
             var cQty = Number(cancelledQtyBySku[sku] || 0);
+
             if (cQty > 0) {
-                cancelled.push({ sku: sku, qty: cQty });
+                cancelled.push({
+                    sku: sku,
+                    qty: cQty,
+                    orderedInJazz: Number((row.orderedQtyBySku || {})[sku] || 0),
+                    shippedInJazz: Number((row.shippedQtyBySku || {})[sku] || 0)
+                });
             }
         }
 
@@ -435,7 +418,8 @@ function (https, record, log, search) {
                     qty: gap,
                     availableOnIf: avail,
                     fulfilled: done,
-                    orderedOnTo: Number((toQtyBySku[sku] || {}).qty || 0)
+                    orderedOnTo: Number((toQtyBySku[sku] || {}).qty || 0),
+                    cancelledInJazz: Number(cancelledQtyBySku[sku] || 0)
                 });
             }
         }
@@ -522,9 +506,6 @@ function (https, record, log, search) {
 
     /* ======================================================================
      * CONSOLIDATED ITEM RECEIPT
-     * TO -> ItemRecpt (IF -> ItemRecpt is not supported for Transfer Orders).
-     * NetSuite defaults lines to fulfilled-but-not-received, so it mirrors the
-     * IF we just saved with no extra matching.
      * ====================================================================== */
 
     function createConsolidatedItemReceipt(row, itemFulfillmentId, memo) {
@@ -594,9 +575,8 @@ function (https, record, log, search) {
 
     /* ======================================================================
      * TRANSFER ORDER QUANTITY SEARCH
-     * Your saved search, grouped by item AND the SKU column so the totals key
-     * on the same value the IF lines match on. Falls back to item-only
-     * grouping if the custom column cannot be grouped.
+     * Grouped by item AND the SKU column so totals key on the same value the
+     * IF lines match on. Falls back to item-only grouping.
      * ====================================================================== */
 
     function getToQtyBySku(toId) {
@@ -681,7 +661,7 @@ function (https, record, log, search) {
     }
 
     /* ======================================================================
-     * JAZZ API
+     * JAZZ - AUTH
      * ====================================================================== */
 
     function getJazzToken() {
@@ -711,11 +691,15 @@ function (https, record, log, search) {
         return token;
     }
 
-    function getAllJazzShipments(token, orderNumber) {
+    /**
+     * Shared paginated GET. Jazz wraps every list endpoint in
+     * { count, next, previous, results }.
+     */
+    function jazzGetAllPages(token, urlBuilder, label) {
         var all = [];
         var offset = 0;
         var page = 0;
-        var nextUrl = buildJazzShipmentUrl(orderNumber, offset);
+        var nextUrl = urlBuilder(0);
 
         while (nextUrl && page < CONFIG.JAZZ_MAX_PAGES) {
             page++;
@@ -724,13 +708,14 @@ function (https, record, log, search) {
                 url: nextUrl,
                 headers: {
                     'Accept': 'application/json',
+                    'Content-Type': 'application/json',
                     'Tenant': CONFIG.JAZZ_TENANT,
                     'Authorization': 'Token ' + token
                 }
             });
 
             if (Number(resp.code) < 200 || Number(resp.code) >= 300) {
-                throw new Error('Jazz shipment failed: ' + resp.code + ' - ' + resp.body);
+                throw new Error('Jazz ' + label + ' failed: ' + resp.code + ' - ' + resp.body);
             }
 
             var body = JSON.parse(resp.body || '{}');
@@ -740,10 +725,11 @@ function (https, record, log, search) {
                 all.push(rows[i]);
             }
 
-            log.audit('JAZZ PAGE READ', {
+            log.audit('JAZZ PAGE READ - ' + label, {
                 page: page,
                 rowsThisPage: rows.length,
-                totalSoFar: all.length
+                totalSoFar: all.length,
+                reportedCount: body.count
             });
 
             if (rows.length === 0) {
@@ -752,24 +738,146 @@ function (https, record, log, search) {
                 nextUrl = normalizeJazzNextUrl(body.next);
             } else if (body.count && all.length < Number(body.count)) {
                 offset = all.length;
-                nextUrl = buildJazzShipmentUrl(orderNumber, offset);
+                nextUrl = urlBuilder(offset);
             } else {
                 nextUrl = '';
             }
         }
 
         if (page >= CONFIG.JAZZ_MAX_PAGES) {
-            log.error('JAZZ PAGINATION HIT SAFETY LIMIT', { totalRows: all.length });
+            log.error('JAZZ PAGINATION HIT SAFETY LIMIT - ' + label, { totalRows: all.length });
         }
 
         return all;
     }
 
-    function buildJazzShipmentUrl(orderNumber, offset) {
-        return 'https://' + CONFIG.JAZZ_DOMAIN +
-            '/api/v1/shipment/status?limit=' + CONFIG.JAZZ_PAGE_LIMIT +
-            '&offset=' + Number(offset || 0) +
-            '&order_number=' + encodeURIComponent(orderNumber);
+    /* ======================================================================
+     * JAZZ - SHIPMENTS  (what physically shipped)
+     * GET /api/v1/shipment/status
+     * ====================================================================== */
+
+    function getAllJazzShipments(token, orderNumber) {
+        return jazzGetAllPages(token, function (offset) {
+            return 'https://' + CONFIG.JAZZ_DOMAIN +
+                '/api/v1/shipment/status?limit=' + CONFIG.JAZZ_PAGE_LIMIT +
+                '&offset=' + Number(offset || 0) +
+                '&order_number=' + encodeURIComponent(orderNumber);
+        }, 'SHIPMENT');
+    }
+
+    /* ======================================================================
+     * JAZZ - ORDERS  (what was ordered / CANCELLED)
+     * GET /api/v1/order/status
+     *
+     * detail_set fields per the Jazz API docs:
+     *   line_number, sku_code, unit_cost, unit_price, unit_discount,
+     *   qty_ordered, qty_canceled, qty_allocated, qty_backordered,
+     *   qty_printed, qty_new, qty_shipped, qty_returned, attributes
+     *
+     * NOTE: qty_canceled has ONE "l".
+     * ====================================================================== */
+
+    function getAllJazzOrders(token, orderNumber) {
+        return jazzGetAllPages(token, function (offset) {
+            return 'https://' + CONFIG.JAZZ_DOMAIN +
+                '/api/v1/order/status?limit=' + CONFIG.JAZZ_PAGE_LIMIT +
+                '&offset=' + Number(offset || 0) +
+                '&order_number=' + encodeURIComponent(orderNumber);
+        }, 'ORDER');
+    }
+
+    function summariseJazzOrders(orders) {
+        var cancelledQtyBySku = {};
+        var orderedQtyBySku = {};
+        var totalCancelledQty = 0;
+        var totalOrderedQty = 0;
+        var statusMap = {};
+        var cancelLines = [];
+
+        for (var i = 0; i < orders.length; i++) {
+            var order = orders[i];
+
+            if (order.status) {
+                statusMap[String(order.status)] = true;
+            }
+
+            var details = order.detail_set ||
+                          order.details ||
+                          order.detail || [];
+
+            for (var d = 0; d < details.length; d++) {
+                var detail = details[d];
+                var sku = normalizeSku(getDetailSku(detail));
+
+                if (!sku) continue;
+
+                var ordered = firstNumber([
+                    detail.qty_ordered,
+                    detail.ordered_qty,
+                    detail.quantity_ordered
+                ]);
+
+                if (ordered > 0) {
+                    addQty(orderedQtyBySku, sku, ordered);
+                    totalOrderedQty += ordered;
+                }
+
+                var cancelled = getDetailCancelledQty(detail);
+
+                if (cancelled > 0) {
+                    addQty(cancelledQtyBySku, sku, cancelled);
+                    totalCancelledQty += cancelled;
+
+                    cancelLines.push({
+                        lineNumber: detail.line_number,
+                        sku: sku,
+                        qtyCancelled: cancelled,
+                        qtyOrdered: ordered,
+                        qtyShipped: firstNumber([detail.qty_shipped])
+                    });
+                }
+            }
+        }
+
+        log.audit('JAZZ ORDER CANCELS', {
+            totalCancelledQty: totalCancelledQty,
+            distinctCancelledSkus: Object.keys(cancelledQtyBySku).length,
+            lines: cancelLines.length ? cancelLines : 'NONE'
+        });
+
+        if (DEBUG_JAZZ_FIELDS && orders.length) {
+            var firstDetails = orders[0].detail_set || orders[0].details || orders[0].detail || [];
+
+            log.audit('JAZZ ORDER FIELD DIAGNOSTIC', {
+                orderFields: Object.keys(orders[0]).sort(),
+                detailFields: firstDetails.length ? Object.keys(firstDetails[0]).sort() : 'NO DETAIL LINES',
+                sampleDetail: firstDetails.length ? firstDetails[0] : null,
+                orderStatuses: Object.keys(statusMap)
+            });
+        }
+
+        return {
+            cancelledQtyBySku: cancelledQtyBySku,
+            orderedQtyBySku: orderedQtyBySku,
+            totalCancelledQty: totalCancelledQty,
+            totalOrderedQty: totalOrderedQty,
+            statuses: Object.keys(statusMap)
+        };
+    }
+
+    /**
+     * Jazz uses qty_canceled (one "l"). The rest are defensive aliases.
+     */
+    function getDetailCancelledQty(detail) {
+        return firstNumber([
+            detail.qty_canceled,
+            detail.qty_cancelled,
+            detail.canceled_qty,
+            detail.cancelled_qty,
+            detail.quantity_canceled,
+            detail.quantity_cancelled,
+            detail.cancel_qty
+        ]);
     }
 
     function normalizeJazzNextUrl(nextValue) {
@@ -793,26 +901,20 @@ function (https, record, log, search) {
     }
 
     /* ======================================================================
-     * JAZZ SUMMARISATION
-     *
-     * Two passes on purpose:
-     *   shipped   - only from eligible (confirmed/shipped/closed) shipments
-     *   cancelled - from EVERY shipment, including cancelled ones, otherwise a
-     *               wholly cancelled shipment never reaches the memo
+     * JAZZ SHIPMENT SUMMARISATION
+     * Shipment status per the docs is only "confirmed" or "unconfirmed".
      * ====================================================================== */
 
     function summariseJazzShipments(shipments) {
         var cartonMap = {};
         var shippedQtyBySku = {};
-        var cancelledQtyBySku = {};
-
         var totalShippedQty = 0;
-        var totalCancelledQty = 0;
 
         var primaryTrackingNumber = '';
         var primaryShipmentNumber = '';
         var earliestShipDate = '';
         var earliestShipDateMs = null;
+        var skippedShipments = 0;
 
         for (var i = 0; i < shipments.length; i++) {
             var shipment = shipments[i];
@@ -823,17 +925,19 @@ function (https, record, log, search) {
 
             if (!details.length) continue;
 
-            var eligible          = isEligibleShipment(shipment);
-            var shipmentNumber    = getShipmentNumber(shipment);
-            var trackingNumber    = getTrackingNumber(shipment);
-            var shipmentCartonNo  = getCartonNumber(shipment);
-            var shipmentDate      = getShipmentDate(shipment);
-            var weight            = getShipmentWeight(shipment);
-
-            if (eligible) {
-                if (!primaryTrackingNumber && trackingNumber) primaryTrackingNumber = trackingNumber;
-                if (!primaryShipmentNumber && shipmentNumber) primaryShipmentNumber = shipmentNumber;
+            if (!isEligibleShipment(shipment)) {
+                skippedShipments++;
+                continue;
             }
+
+            var shipmentNumber   = getShipmentNumber(shipment);
+            var trackingNumber   = getTrackingNumber(shipment);
+            var shipmentCartonNo = getCartonNumber(shipment);
+            var shipmentDate     = getShipmentDate(shipment);
+            var weight           = getShipmentWeight(shipment);
+
+            if (!primaryTrackingNumber && trackingNumber) primaryTrackingNumber = trackingNumber;
+            if (!primaryShipmentNumber && shipmentNumber) primaryShipmentNumber = shipmentNumber;
 
             for (var d = 0; d < details.length; d++) {
                 var detail = details[d];
@@ -841,17 +945,6 @@ function (https, record, log, search) {
 
                 if (!sku) continue;
 
-                /* ---- cancelled: captured from every shipment ---- */
-                var cancelledQty = getDetailCancelledQty(detail);
-
-                if (cancelledQty > 0) {
-                    addQty(cancelledQtyBySku, sku, cancelledQty);
-                    totalCancelledQty += cancelledQty;
-                }
-
-                if (!eligible) continue;
-
-                /* ---- shipped ---- */
                 var qty = getDetailShippedQty(detail);
                 if (qty <= 0) continue;
 
@@ -897,6 +990,10 @@ function (https, record, log, search) {
             }
         }
 
+        if (skippedShipments > 0) {
+            log.audit('SHIPMENTS SKIPPED - NOT CONFIRMED', { count: skippedShipments });
+        }
+
         var cartons = [];
         for (var key in cartonMap) {
             if (cartonMap.hasOwnProperty(key)) cartons.push(cartonMap[key]);
@@ -905,9 +1002,7 @@ function (https, record, log, search) {
         return {
             cartons: cartons,
             shippedQtyBySku: shippedQtyBySku,
-            cancelledQtyBySku: cancelledQtyBySku,
             totalShippedQty: totalShippedQty,
-            totalCancelledQty: totalCancelledQty,
             primaryTrackingNumber: primaryTrackingNumber,
             primaryShipmentNumber: primaryShipmentNumber,
             earliestShipDate: earliestShipDate
@@ -916,44 +1011,14 @@ function (https, record, log, search) {
 
     function isEligibleShipment(shipment) {
         var status = String(
-            shipment.status || shipment.shipment_status || shipment.order_status || ''
+            shipment.status || shipment.shipment_status || ''
         ).toLowerCase();
 
-        return status === 'confirmed' || status === 'shipped' || status === 'closed';
-    }
-
-    /**
-     * Explicit cancelled qty wins. If the line is flagged cancelled but carries
-     * no cancelled number, fall back to ordered-minus-shipped.
-     */
-    function getDetailCancelledQty(detail) {
-        var explicit = firstNumber([
-            detail.qty_cancelled,
-            detail.cancelled_qty,
-            detail.canceled_qty,
-            detail.quantity_cancelled
-        ]);
-
-        if (explicit > 0) return explicit;
-
-        var status = String(
-            detail.status || detail.line_status || detail.cancel_status || ''
-        ).toLowerCase();
-
-        if (status.indexOf('cancel') === -1) return 0;
-
-        var ordered = firstNumber([
-            detail.qty_ordered,
-            detail.ordered_qty,
-            detail.quantity_ordered,
-            detail.qty,
-            detail.quantity
-        ]);
-
-        var shipped = getDetailShippedQty(detail);
-        var gap = ordered - shipped;
-
-        return gap > 0 ? gap : 0;
+        // Docs: shipment status is "confirmed" or "unconfirmed".
+        // shipped/closed kept as harmless legacy aliases.
+        return status === 'confirmed' ||
+               status === 'shipped' ||
+               status === 'closed';
     }
 
     function getDetailSku(detail) {
@@ -1069,7 +1134,7 @@ function (https, record, log, search) {
                 fieldId: LINE_SKU_FIELD,
                 line: line
             });
-        } catch (e) { /* custom column absent on this line */ }
+        } catch (e) { /* custom column absent */ }
 
         if (!sku) {
             try {
