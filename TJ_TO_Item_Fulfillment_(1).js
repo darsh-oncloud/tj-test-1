@@ -2,121 +2,155 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  *
- * Purpose:
- * - Hardcoded TO + WMS order number.
- * - Call Jazz shipment API and get ALL shipments/cartons for the WMS order.
- * - Instead of one Item Fulfillment per carton, build ONE CONSOLIDATED
- *   Item Fulfillment for the whole Transfer Order:
- *      - All cartons are added as separate lines on the "Package" subtab
- *        (tracking number + carton number + weight per carton).
- *      - All Jazz item quantities are SUMMED BY SKU across every carton,
- *        then matched/fulfilled against the TO lines on the single IF.
- * - Skip cancelled / zero shipped qty lines.
- * - Prevent duplicate consolidated IF creation by WMS order number
- *   (since there should only ever be ONE IF for this TO now).
- * - Set Jazz shipment date on trandate, packeddate, shippeddate, pickeddate
- *   (uses the earliest ship date found across all cartons).
+ * TRANSFER ORDER -> ONE CONSOLIDATED ITEM FULFILLMENT + ONE ITEM RECEIPT
+ * Source of truth for quantities: Jazz OMS shipment API.
  *
- * IMPORTANT:
- * - This script produces exactly ONE input row (the whole order), so it will
- *   create at most ONE Item Fulfillment total. Deployment concurrency does
- *   not matter for correctness here (only one map executes), but leave it
- *   at 1 anyway to be safe.
+ * ---------------------------------------------------------------------------
+ * HOW QUANTITIES ARE DECIDED (this is the important part)
+ * ---------------------------------------------------------------------------
+ * 1. Pull EVERY shipment/carton from Jazz for the WMS order number.
+ * 2. SUM shipped qty BY SKU across all cartons  -> shippedQtyBySku
+ *    SUM cancelled qty BY SKU across all cartons -> cancelledQtyBySku
+ * 3. Transform TO -> Item Fulfillment. Uncheck every line.
+ * 4. Walk the IF lines in order. For each line whose SKU still has Jazz qty
+ *    left to allocate, fulfil min(jazzRemaining, lineAvailable).
+ *    A SKU spread over several TO lines fills top-down until Jazz qty is gone.
+ *    There is NO carton-by-carton validation - quantities are pooled.
+ * 5. Whatever does not reconcile goes in the MEMO (see below).
+ * 6. ALL cartons are written to the Package subtab regardless of shortfalls.
  *
- * NEW - ITEM RECEIPT STEP:
- * - After the consolidated Item Fulfillment is created and saved, this
- *   script now ALSO transforms the SAME TRANSFER ORDER into ONE
- *   consolidated Item Receipt (record.transform TransferOrd -> ItemRecpt).
- *   NOTE: Item Fulfillment -> Item Receipt is NOT a supported transform
- *   for Transfer Orders in NetSuite - the receipt must be created from
- *   the TO directly, same as the Item Fulfillment was.
- * - NetSuite auto-defaults the Item Receipt's line quantities to whatever
- *   was fulfilled-but-not-yet-received on the TO, so it lines up
- *   automatically with the IF we just created - no separate SKU/qty
- *   matching needed here.
- * - If the receipt fails to create for any reason, it is logged clearly,
- *   but the Item Fulfillment that was already created is NOT rolled back.
+ * ---------------------------------------------------------------------------
+ * MEMO FORMAT (capped at 999 chars, NetSuite body memo limit)
+ * ---------------------------------------------------------------------------
+ *   CANCELLED(JAZZ): SKU x5, SKU x2 || SHORT(NOT SHIPPED): SKU x90 ||
+ *   EXTRA(JAZZ>TO): SKU x3
+ *
+ *   CANCELLED(JAZZ) - qty Jazz reported cancelled on the order.
+ *   SHORT(NOT SHIPPED) - on the TO / available to fulfil, but Jazz never
+ *                        shipped it. (4000 ordered vs 390 shipped lands here.)
+ *   EXTRA(JAZZ>TO)     - Jazz shipped more than the TO had available, or the
+ *                        SKU is not on the TO at all ([NOT-ON-TO] tag).
+ *
+ * Full untruncated detail is always written to the execution log even when the
+ * memo is truncated. Look for the RECONCILIATION DETAIL audit entry.
+ *
+ * ---------------------------------------------------------------------------
+ * NOTES / GOTCHAS
+ * ---------------------------------------------------------------------------
+ * - IF -> Item Receipt is NOT a supported transform for Transfer Orders. The
+ *   receipt must be created from the TO directly. NetSuite defaults the receipt
+ *   lines to fulfilled-but-not-yet-received, so it lines up with the IF
+ *   automatically. No second round of SKU matching needed.
+ * - If the receipt fails, the IF is NOT rolled back. It is logged loudly.
+ * - Lot / serial numbered items would need inventorydetail populated on the IF
+ *   lines. This script does not do that - add it if your items are tracked.
  */
 
 define(['N/https', 'N/record', 'N/log', 'N/search'],
 function (https, record, log, search) {
 
+    'use strict';
+
     /*************************************************************
-     * HARDCODE VALUES HERE
+     * CONFIG - HARDCODE EVERYTHING HERE
      *************************************************************/
-    var TO_ID = 142435642;
-    var WMS_ORDER_NUMBER = 'TOMFBA143320390';
+    var CONFIG = {
+        TO_ID:            142435642,
+        WMS_ORDER_NUMBER: 'TOMFBA143320390',
+
+        JAZZ_DOMAIN:   'fbflurry.jazz-oms.com',
+        JAZZ_USERNAME: 'Dsoni',
+        JAZZ_PASSWORD: 'OnCloud2026!!',
+        JAZZ_TENANT:   'TMJ',
+
+        JAZZ_PAGE_LIMIT: 250,
+        JAZZ_MAX_PAGES:  100
+    };
 
     /*************************************************************
      * FIELD IDS
      *************************************************************/
     var LINE_SKU_FIELD = 'custcol_sku_external_id';
 
-    var BODY_WMS_ORDER_NUMBER = 'custbody_wms_order_number';
-    var BODY_TRACKING_NUMBER = 'custbody_mtracking';
-    var BODY_TOTAL_QTY_SHIPPED = 'custbody_total_qty_shipped';
-    var BODY_NO_CARTONS = 'custbody_no_cartons';
+    var BODY_WMS_ORDER_NUMBER    = 'custbody_wms_order_number';
+    var BODY_TRACKING_NUMBER     = 'custbody_mtracking';
+    var BODY_TOTAL_QTY_SHIPPED   = 'custbody_total_qty_shipped';
+    var BODY_NO_CARTONS          = 'custbody_no_cartons';
     var BODY_JAZZ_SHIPMENT_NUMBER = 'custbody_jazz_shipment_number';
 
-    /*************************************************************
-     * JAZZ API CONFIG
-     *************************************************************/
-    var JAZZ_DOMAIN = 'fbflurry.jazz-oms.com';
-    var JAZZ_USERNAME = 'Dsoni';
-    var JAZZ_PASSWORD = 'OnCloud2026!!';
-    var JAZZ_TENANT = 'TMJ';
+    var MAX_MEMO_LENGTH = 999;
 
-    var JAZZ_PAGE_LIMIT = 250;
+    /* ======================================================================
+     * GET INPUT DATA
+     * ====================================================================== */
 
     function getInputData() {
         log.audit('INPUT START', {
-            toId: TO_ID,
-            wmsOrderNumber: WMS_ORDER_NUMBER
+            toId: CONFIG.TO_ID,
+            wmsOrderNumber: CONFIG.WMS_ORDER_NUMBER
         });
 
-        var token = getJazzToken();
+        var token     = getJazzToken();
+        var shipments = getAllJazzShipments(token, CONFIG.WMS_ORDER_NUMBER);
 
-        var shipments = getAllJazzShipments(token, WMS_ORDER_NUMBER);
+        var jazz = summariseJazzShipments(shipments);
+        var toQtyBySku = getToQtyBySku(CONFIG.TO_ID);
 
-        var consolidatedRow = buildConsolidatedRow(shipments);
+        var row = {
+            toId:            CONFIG.TO_ID,
+            wmsOrderNumber:  CONFIG.WMS_ORDER_NUMBER,
 
-        log.audit('INPUT CONSOLIDATED ROW BUILT', {
-            totalShipmentsFromJazz: shipments.length,
-            totalCartonsFound: consolidatedRow.cartons.length,
-            totalDistinctSkus: Object.keys(consolidatedRow.requiredQtyBySku).length,
-            totalQtyAcrossAllCartons: consolidatedRow.totalQty
+            cartons:            jazz.cartons,
+            shippedQtyBySku:    jazz.shippedQtyBySku,
+            cancelledQtyBySku:  jazz.cancelledQtyBySku,
+            totalShippedQty:    jazz.totalShippedQty,
+            totalCancelledQty:  jazz.totalCancelledQty,
+
+            toQtyBySku:      toQtyBySku,
+
+            primaryTrackingNumber: jazz.primaryTrackingNumber,
+            primaryShipmentNumber: jazz.primaryShipmentNumber,
+            earliestShipDate:      jazz.earliestShipDate
+        };
+
+        log.audit('INPUT SUMMARY', {
+            shipmentsFromJazz:  shipments.length,
+            cartonsFound:       jazz.cartons.length,
+            distinctShippedSku: Object.keys(jazz.shippedQtyBySku).length,
+            totalShippedQty:    jazz.totalShippedQty,
+            distinctCancelSku:  Object.keys(jazz.cancelledQtyBySku).length,
+            totalCancelledQty:  jazz.totalCancelledQty,
+            distinctToSku:      Object.keys(toQtyBySku).length
         });
 
-        // Only ONE row -> only ONE map execution -> ONE Item Fulfillment.
-        return [consolidatedRow];
+        // Exactly one row -> exactly one map execution -> at most one IF.
+        return [row];
     }
+
+    /* ======================================================================
+     * MAP
+     * ====================================================================== */
 
     function map(context) {
         var row = JSON.parse(context.value);
 
         try {
             if (!row.cartons || row.cartons.length === 0) {
-                log.audit('SKIP - NO CARTONS FOUND', row);
-                context.write({
+                log.audit('SKIP - NO CARTONS', { wmsOrderNumber: row.wmsOrderNumber });
+                return context.write({
                     key: 'SKIPPED',
                     value: JSON.stringify({
-                        reason: 'No eligible cartons found in Jazz for this WMS order',
-                        row: row
+                        reason: 'No eligible cartons found in Jazz for this WMS order.',
+                        wmsOrderNumber: row.wmsOrderNumber
                     })
                 });
-                return;
             }
 
             var existing = findExistingItemFulfillment(row.toId, row.wmsOrderNumber);
 
             if (existing.found) {
-                log.audit('SKIP - CONSOLIDATED IF ALREADY EXISTS', {
-                    wmsOrderNumber: row.wmsOrderNumber,
-                    existingItemFulfillmentId: existing.id,
-                    existingTranId: existing.tranid
-                });
-
-                context.write({
+                log.audit('SKIP - IF ALREADY EXISTS', existing);
+                return context.write({
                     key: 'DUPLICATE_SKIPPED',
                     value: JSON.stringify({
                         wmsOrderNumber: row.wmsOrderNumber,
@@ -124,45 +158,36 @@ function (https, record, log, search) {
                         existingTranId: existing.tranid
                     })
                 });
-
-                return;
             }
 
             var result = createConsolidatedFulfillment(row);
+            log.audit('FULFILLMENT RESULT', result);
 
-            log.audit('CONSOLIDATED FULFILLMENT RESULT', result);
-
-            if (result.success) {
-
-                /*****************************************************
-                 * NEW: Create ONE consolidated Item Receipt from the
-                 * Item Fulfillment we just created.
-                 *****************************************************/
-                var receiptResult = createConsolidatedItemReceipt(row, result.itemFulfillmentId);
-
-                log.audit('CONSOLIDATED ITEM RECEIPT RESULT', receiptResult);
-
-                result.itemReceiptId = receiptResult.itemReceiptId;
-                result.itemReceiptMessage = receiptResult.message;
-
-                if (!receiptResult.success) {
-                    log.error('ITEM RECEIPT FAILED - IF ALREADY CREATED', {
-                        wmsOrderNumber: row.wmsOrderNumber,
-                        itemFulfillmentId: result.itemFulfillmentId,
-                        reason: receiptResult.message
-                    });
-                }
-
-                context.write({
-                    key: receiptResult.success ? 'CREATED' : 'CREATED_IF_ONLY_RECEIPT_FAILED',
-                    value: JSON.stringify(result)
-                });
-            } else {
-                context.write({
+            if (!result.success) {
+                return context.write({
                     key: 'SKIPPED',
                     value: JSON.stringify(result)
                 });
             }
+
+            var receipt = createConsolidatedItemReceipt(row, result.itemFulfillmentId, result.memo);
+            log.audit('ITEM RECEIPT RESULT', receipt);
+
+            result.itemReceiptId      = receipt.itemReceiptId;
+            result.itemReceiptMessage = receipt.message;
+
+            if (!receipt.success) {
+                log.error('ITEM RECEIPT FAILED - IF ALREADY CREATED', {
+                    wmsOrderNumber: row.wmsOrderNumber,
+                    itemFulfillmentId: result.itemFulfillmentId,
+                    reason: receipt.message
+                });
+            }
+
+            context.write({
+                key: receipt.success ? 'CREATED' : 'CREATED_IF_ONLY_RECEIPT_FAILED',
+                value: JSON.stringify(result)
+            });
 
         } catch (e) {
             log.error('MAP ERROR', {
@@ -181,105 +206,174 @@ function (https, record, log, search) {
         }
     }
 
-    /*************************************************************
-     * CREATE ONE CONSOLIDATED ITEM FULFILLMENT
-     * - Sums Jazz qty by SKU across ALL cartons
-     * - Adds ONE package line per carton (tracking + carton number + weight)
-     *************************************************************/
+    /* ======================================================================
+     * CONSOLIDATED ITEM FULFILLMENT
+     * ====================================================================== */
+
     function createConsolidatedFulfillment(row) {
         var result = {
             success: false,
             toId: row.toId,
             wmsOrderNumber: row.wmsOrderNumber,
-            totalCartons: row.cartons.length,
             itemFulfillmentId: '',
-            fulfillLineCount: 0,
-            fulfillQtyTotal: 0,
-            skippedLineCount: 0,
-            unmatchedJazzSkus: [],
+            totalCartons: row.cartons.length,
+            packageLinesAdded: 0,
+            fulfilledLineCount: 0,
+            fulfilledQtyTotal: 0,
+            unfulfilledLineCount: 0,
+            memo: '',
+            memoTruncated: false,
+            reconciliation: null,
             message: ''
         };
 
-        var requiredQtyBySku = row.requiredQtyBySku || {};
+        var shippedQtyBySku = row.shippedQtyBySku || {};
 
-        if (Object.keys(requiredQtyBySku).length === 0) {
-            result.message = 'Skipped - no shipped item quantity found across any carton.';
+        if (Object.keys(shippedQtyBySku).length === 0) {
+            result.message = 'Skipped - Jazz reported zero shipped quantity across all cartons.';
             return result;
         }
 
         var ifRec = record.transform({
             fromType: record.Type.TRANSFER_ORDER,
-            fromId: row.toId,
-            toType: record.Type.ITEM_FULFILLMENT,
+            fromId:   row.toId,
+            toType:   record.Type.ITEM_FULFILLMENT,
             isDynamic: false
         });
 
-        /*********************************************************
-         * SHIP DATE
-         * Use the earliest ship date found across all cartons.
-         *********************************************************/
-        var jazzShipDate = parseJazzDate(row.earliestShipDate);
+        /* ---------- header ---------- */
 
-        if (jazzShipDate) {
-            trySet(ifRec, 'trandate', jazzShipDate);
-            trySet(ifRec, 'packeddate', jazzShipDate);
-            trySet(ifRec, 'shippeddate', jazzShipDate);
-            trySet(ifRec, 'pickeddate', jazzShipDate);
+        var shipDate = parseJazzDate(row.earliestShipDate);
 
-            log.audit('JAZZ DATE SET ON CONSOLIDATED IF', {
-                wmsOrderNumber: row.wmsOrderNumber,
-                rawShipDate: row.earliestShipDate,
-                parsedDate: jazzShipDate
-            });
+        if (shipDate) {
+            trySet(ifRec, 'trandate',    shipDate);
+            trySet(ifRec, 'packeddate',  shipDate);
+            trySet(ifRec, 'shippeddate', shipDate);
+            trySet(ifRec, 'pickeddate',  shipDate);
         } else {
-            log.audit('JAZZ SHIP DATE NOT FOUND / INVALID', {
+            log.audit('JAZZ SHIP DATE MISSING/INVALID', {
                 wmsOrderNumber: row.wmsOrderNumber,
-                rawShipDate: row.earliestShipDate
+                raw: row.earliestShipDate
             });
         }
 
-        /*********************************************************
-         * HEADER VALUES
-         *********************************************************/
         trySet(ifRec, 'shipstatus', 'C');
-        trySet(ifRec, BODY_TRACKING_NUMBER, row.primaryTrackingNumber);
-        trySet(ifRec, BODY_WMS_ORDER_NUMBER, row.wmsOrderNumber);
-        trySet(ifRec, BODY_TOTAL_QTY_SHIPPED, row.totalQty);
-        trySet(ifRec, BODY_NO_CARTONS, String(row.cartons.length));
+        trySet(ifRec, BODY_TRACKING_NUMBER,      row.primaryTrackingNumber);
+        trySet(ifRec, BODY_WMS_ORDER_NUMBER,     row.wmsOrderNumber);
+        trySet(ifRec, BODY_NO_CARTONS,           String(row.cartons.length));
         trySet(ifRec, BODY_JAZZ_SHIPMENT_NUMBER, row.primaryShipmentNumber);
 
-        /*********************************************************
-         * MATCH JAZZ SKU (SUMMED ACROSS ALL CARTONS) TO IF LINES
-         * (Package lines are added AFTER this, once we know which
-         * SKUs came up short - see below.)
-         *********************************************************/
-        var remainingBySku = copyObj(requiredQtyBySku);
+        /* ---------- allocate pooled Jazz qty across IF lines ---------- */
 
-        var lineCount = ifRec.getLineCount({
-            sublistId: 'item'
+        var alloc = allocateQuantities(ifRec, shippedQtyBySku);
+
+        result.fulfilledLineCount   = alloc.fulfilledLineCount;
+        result.fulfilledQtyTotal    = alloc.fulfilledQtyTotal;
+        result.unfulfilledLineCount = alloc.unfulfilledLineCount;
+
+        trySet(ifRec, BODY_TOTAL_QTY_SHIPPED, alloc.fulfilledQtyTotal);
+
+        if (alloc.fulfilledLineCount <= 0) {
+            result.message = 'Skipped - no TO line matched any Jazz SKU with available quantity.';
+            return result;
+        }
+
+        /* ---------- reconcile and build memo ---------- */
+
+        var recon = buildReconciliation(row, alloc);
+        var memo  = buildMemoString(recon);
+
+        result.reconciliation = {
+            cancelledCount:  recon.cancelled.length,
+            shortCount:      recon.short.length,
+            extraCount:      recon.extra.length,
+            cancelledQty:    sumBucket(recon.cancelled),
+            shortQty:        sumBucket(recon.short),
+            extraQty:        sumBucket(recon.extra)
+        };
+        result.memo          = memo.text;
+        result.memoTruncated = memo.truncated;
+
+        // Full detail always lands in the log, even when the memo is clipped.
+        log.audit('RECONCILIATION DETAIL', {
+            wmsOrderNumber: row.wmsOrderNumber,
+            cancelledInJazz: recon.cancelled,
+            shortNotShipped: recon.short,
+            extraJazzOverTo: recon.extra
         });
 
-        // First uncheck all lines
+        if (memo.text) {
+            trySet(ifRec, 'memo', memo.text);
+        }
+
+        /* ---------- packages: every carton, no exclusions ---------- */
+
+        clearPackageLines(ifRec);
+
+        for (var c = 0; c < row.cartons.length; c++) {
+            var carton = row.cartons[c];
+            if (addOnePackageLine(ifRec, result.packageLinesAdded, carton)) {
+                result.packageLinesAdded++;
+            }
+        }
+
+        log.audit('PACKAGE LINES ADDED', {
+            wmsOrderNumber: row.wmsOrderNumber,
+            cartonsFound: row.cartons.length,
+            packageLinesAdded: result.packageLinesAdded
+        });
+
+        /* ---------- save ---------- */
+
+        result.itemFulfillmentId = ifRec.save({
+            enableSourcing: false,
+            ignoreMandatoryFields: true
+        });
+
+        result.success = true;
+        result.message = 'Consolidated Item Fulfillment created for all cartons.';
+
+        return result;
+    }
+
+    /**
+     * Uncheck every line, then walk lines in order allocating pooled Jazz qty.
+     * Returns the allocation outcome plus everything needed to reconcile.
+     */
+    function allocateQuantities(ifRec, shippedQtyBySku) {
+        var out = {
+            fulfilledLineCount: 0,
+            fulfilledQtyTotal: 0,
+            unfulfilledLineCount: 0,
+            remainingJazzBySku: copyObj(shippedQtyBySku), // Jazz qty NOT placed
+            fulfilledBySku: {},                            // qty actually placed
+            availableBySku: {},                            // qty the IF offered
+            skusOnIf: {}
+        };
+
+        var lineCount = ifRec.getLineCount({ sublistId: 'item' });
+
         for (var i = 0; i < lineCount; i++) {
             setReceive(ifRec, i, false);
         }
 
         for (var line = 0; line < lineCount; line++) {
-            var lineSku = getLineSku(ifRec, line);
-            var lineAvailableQty = getLineAvailableQty(ifRec, line);
-            var jazzRemainingQty = Number(remainingBySku[lineSku] || 0);
+            var sku       = getLineSku(ifRec, line);
+            var available = getLineAvailableQty(ifRec, line);
 
-            if (!lineSku || jazzRemainingQty <= 0 || lineAvailableQty <= 0) {
-                result.skippedLineCount++;
+            if (sku) {
+                out.skusOnIf[sku] = true;
+                addQty(out.availableBySku, sku, available);
+            }
+
+            var jazzLeft = Number(out.remainingJazzBySku[sku] || 0);
+
+            if (!sku || available <= 0 || jazzLeft <= 0) {
+                out.unfulfilledLineCount++;
                 continue;
             }
 
-            var qtyToFulfill = Math.min(jazzRemainingQty, lineAvailableQty);
-
-            if (qtyToFulfill <= 0) {
-                result.skippedLineCount++;
-                continue;
-            }
+            var qty = Math.min(jazzLeft, available);
 
             setReceive(ifRec, line, true);
 
@@ -287,131 +381,153 @@ function (https, record, log, search) {
                 sublistId: 'item',
                 fieldId: 'quantity',
                 line: line,
-                value: qtyToFulfill
+                value: qty
             });
 
-            remainingBySku[lineSku] = jazzRemainingQty - qtyToFulfill;
+            out.remainingJazzBySku[sku] = jazzLeft - qty;
+            addQty(out.fulfilledBySku, sku, qty);
 
-            result.fulfillLineCount++;
-            result.fulfillQtyTotal += qtyToFulfill;
-        }
+            out.fulfilledLineCount++;
+            out.fulfilledQtyTotal += qty;
 
-        /*********************************************************
-         * COLLECT UNMATCHED JAZZ SKU/QTY
-         * (remainingBySku now holds, per SKU, how much Jazz shipped
-         * that COULD NOT be fulfilled anywhere on the IF.)
-         *********************************************************/
-        var shortfallSkus = {}; // SKU -> remaining qty not fulfilled
-
-        for (var sku in remainingBySku) {
-            if (remainingBySku.hasOwnProperty(sku)) {
-                var remainingQty = Number(remainingBySku[sku] || 0);
-
-                if (remainingQty > 0) {
-                    shortfallSkus[sku] = remainingQty;
-
-                    result.unmatchedJazzSkus.push({
-                        sku: sku,
-                        remainingQtyNotMatched: remainingQty
-                    });
-                }
+            if (qty < available) {
+                out.unfulfilledLineCount++; // partially fulfilled
             }
         }
 
-        /*********************************************************
-         * PACKAGE LINES
-         * Only add a carton to the Package subtab if EVERY item in
-         * that carton was fully fulfilled (i.e. none of its SKUs
-         * are in shortfallSkus). If a carton contains ANY SKU that
-         * came up short anywhere on the order, we can't be sure this
-         * exact carton's units were the ones that fulfilled vs the
-         * ones left over (quantities are pooled across cartons), so
-         * to be safe we EXCLUDE that carton from Package and log it
-         * clearly instead of guessing.
-         *********************************************************/
-        clearPackageLines(ifRec);
-
-        result.packageLinesAdded = 0;
-        result.cartonsExcludedFromPackage = [];
-
-        var packageLineIndex = 0;
-
-        for (var c = 0; c < row.cartons.length; c++) {
-            var carton = row.cartons[c];
-            var cartonItems = carton.items || [];
-            var cartonShortfalls = [];
-
-            for (var ci = 0; ci < cartonItems.length; ci++) {
-                var itemSku = cartonItems[ci].sku;
-
-                if (shortfallSkus.hasOwnProperty(itemSku)) {
-                    cartonShortfalls.push({
-                        sku: itemSku,
-                        cartonQty: cartonItems[ci].qty,
-                        totalRemainingNotFulfilledForThisSku: shortfallSkus[itemSku]
-                    });
-                }
-            }
-
-            if (cartonShortfalls.length > 0) {
-                log.audit('CARTON EXCLUDED FROM PACKAGE - ITEM NOT FULLY FULFILLED', {
-                    wmsOrderNumber: row.wmsOrderNumber,
-                    cartonNumber: carton.cartonNumber,
-                    trackingNumber: carton.trackingNumber,
-                    reason: 'One or more SKUs in this carton were not fully fulfilled on the Item Fulfillment.',
-                    affectedSkus: cartonShortfalls
-                });
-
-                result.cartonsExcludedFromPackage.push({
-                    cartonNumber: carton.cartonNumber,
-                    affectedSkus: cartonShortfalls
-                });
-
-                continue;
-            }
-
-            addOnePackageLine(ifRec, packageLineIndex, carton.trackingNumber, carton.cartonNumber, carton.weight);
-            packageLineIndex++;
-            result.packageLinesAdded++;
-        }
-
-        log.audit('PACKAGE LINES ADDED', {
-            wmsOrderNumber: row.wmsOrderNumber,
-            totalCartonsFound: row.cartons.length,
-            packageLinesAdded: result.packageLinesAdded,
-            cartonsExcluded: result.cartonsExcludedFromPackage.length
-        });
-
-        if (result.fulfillLineCount <= 0) {
-            result.message = 'Skipped - no matching available TO lines for any Jazz SKU.';
-            return result;
-        }
-
-        var ifId = ifRec.save({
-            enableSourcing: false,
-            ignoreMandatoryFields: true
-        });
-
-        result.success = true;
-        result.itemFulfillmentId = ifId;
-        result.message = 'Consolidated Item Fulfillment created successfully for all cartons.';
-
-        return result;
+        return out;
     }
 
-    /*************************************************************
-     * NEW: CREATE ONE CONSOLIDATED ITEM RECEIPT
-     * - NetSuite does NOT allow Item Fulfillment -> Item Receipt
-     *   transform for Transfer Orders. The correct/only supported
-     *   transform is TRANSFER ORDER -> ITEM RECEIPT directly
-     *   (same as how the Item Fulfillment itself was created from
-     *   the TO). NetSuite auto-defaults the receipt's line quantities
-     *   to whatever was fulfilled-but-not-yet-received on that TO,
-     *   so no separate SKU/qty matching is needed here - it will
-     *   automatically line up with the Item Fulfillment we just saved.
-     * - itemFulfillmentId is only passed in for logging/traceability.
-     *************************************************************/
-    function createConsolidatedItemReceipt(row, itemFulfillmentId) {
+    /**
+     * Three buckets:
+     *   cancelled - Jazz reported cancelled qty
+     *   short     - available on the IF but Jazz never shipped it
+     *   extra     - Jazz shipped more than the IF could take, or SKU not on TO
+     */
+    function buildReconciliation(row, alloc) {
+        var cancelled = [];
+        var short = [];
+        var extra = [];
+
+        var cancelledQtyBySku = row.cancelledQtyBySku || {};
+        var toQtyBySku        = row.toQtyBySku || {};
+        var sku;
+
+        for (sku in cancelledQtyBySku) {
+            if (!cancelledQtyBySku.hasOwnProperty(sku)) continue;
+
+            var cQty = Number(cancelledQtyBySku[sku] || 0);
+            if (cQty > 0) {
+                cancelled.push({ sku: sku, qty: cQty });
+            }
+        }
+
+        for (sku in alloc.availableBySku) {
+            if (!alloc.availableBySku.hasOwnProperty(sku)) continue;
+
+            var avail = Number(alloc.availableBySku[sku] || 0);
+            var done  = Number(alloc.fulfilledBySku[sku] || 0);
+            var gap   = avail - done;
+
+            if (gap > 0) {
+                short.push({
+                    sku: sku,
+                    qty: gap,
+                    availableOnIf: avail,
+                    fulfilled: done,
+                    orderedOnTo: Number((toQtyBySku[sku] || {}).qty || 0)
+                });
+            }
+        }
+
+        for (sku in alloc.remainingJazzBySku) {
+            if (!alloc.remainingJazzBySku.hasOwnProperty(sku)) continue;
+
+            var left = Number(alloc.remainingJazzBySku[sku] || 0);
+            if (left <= 0) continue;
+
+            extra.push({
+                sku: sku,
+                qty: left,
+                notOnTo: !alloc.skusOnIf[sku],
+                jazzShipped: Number((row.shippedQtyBySku || {})[sku] || 0)
+            });
+        }
+
+        cancelled.sort(byQtyDesc);
+        short.sort(byQtyDesc);
+        extra.sort(byQtyDesc);
+
+        return { cancelled: cancelled, short: short, extra: extra };
+    }
+
+    function buildMemoString(recon) {
+        var sections = [];
+
+        if (recon.cancelled.length) {
+            sections.push({ label: 'CANCELLED(JAZZ)', rows: recon.cancelled, tagNotOnTo: false });
+        }
+        if (recon.short.length) {
+            sections.push({ label: 'SHORT(NOT SHIPPED)', rows: recon.short, tagNotOnTo: false });
+        }
+        if (recon.extra.length) {
+            sections.push({ label: 'EXTRA(JAZZ>TO)', rows: recon.extra, tagNotOnTo: true });
+        }
+
+        if (!sections.length) {
+            return { text: '', truncated: false };
+        }
+
+        var text = '';
+        var truncated = false;
+
+        for (var s = 0; s < sections.length; s++) {
+            var sec = sections[s];
+            var head = (text ? ' || ' : '') + sec.label + ': ';
+
+            if (text.length + head.length >= MAX_MEMO_LENGTH) {
+                truncated = true;
+                break;
+            }
+
+            text += head;
+
+            var written = 0;
+
+            for (var r = 0; r < sec.rows.length; r++) {
+                var item = sec.rows[r];
+                var piece = (written ? ', ' : '') + item.sku + ' x' + item.qty +
+                            (sec.tagNotOnTo && item.notOnTo ? '[NOT-ON-TO]' : '');
+
+                var overflowNote = ' +' + (sec.rows.length - r) + ' more';
+
+                if (text.length + piece.length + overflowNote.length > MAX_MEMO_LENGTH) {
+                    text += overflowNote;
+                    truncated = true;
+                    break;
+                }
+
+                text += piece;
+                written++;
+            }
+        }
+
+        if (text.length > MAX_MEMO_LENGTH) {
+            text = text.substring(0, MAX_MEMO_LENGTH);
+            truncated = true;
+        }
+
+        return { text: text, truncated: truncated };
+    }
+
+    /* ======================================================================
+     * CONSOLIDATED ITEM RECEIPT
+     * TO -> ItemRecpt (IF -> ItemRecpt is not supported for Transfer Orders).
+     * NetSuite defaults lines to fulfilled-but-not-received, so it mirrors the
+     * IF we just saved with no extra matching.
+     * ====================================================================== */
+
+    function createConsolidatedItemReceipt(row, itemFulfillmentId, memo) {
         var result = {
             success: false,
             itemReceiptId: '',
@@ -420,45 +536,46 @@ function (https, record, log, search) {
         };
 
         if (!row || !row.toId) {
-            result.message = 'Skipped - no Transfer Order ID provided.';
+            result.message = 'Skipped - no Transfer Order ID.';
             return result;
         }
 
         try {
             var irRec = record.transform({
                 fromType: record.Type.TRANSFER_ORDER,
-                fromId: row.toId,
-                toType: record.Type.ITEM_RECEIPT,
+                fromId:   row.toId,
+                toType:   record.Type.ITEM_RECEIPT,
                 isDynamic: false
             });
 
-            var lineCount = irRec.getLineCount({
-                sublistId: 'item'
-            });
+            result.lineCount = irRec.getLineCount({ sublistId: 'item' });
 
-            result.lineCount = lineCount;
+            if (result.lineCount <= 0) {
+                result.message = 'Skipped - transformed Item Receipt has 0 lines. ' +
+                    'Nothing outstanding to receive - confirm the IF saved with quantities.';
 
-            if (lineCount <= 0) {
-                log.error('ITEM RECEIPT - NO LINES FOUND AFTER TRANSFORM', {
+                log.error('ITEM RECEIPT - NO LINES AFTER TRANSFORM', {
                     toId: row.toId,
                     itemFulfillmentId: itemFulfillmentId,
                     wmsOrderNumber: row.wmsOrderNumber
                 });
 
-                result.message = 'Skipped - transformed Item Receipt has 0 lines. Nothing outstanding to receive from the TO - check if the Item Fulfillment actually saved with quantities.';
                 return result;
             }
 
             trySet(irRec, BODY_WMS_ORDER_NUMBER, row.wmsOrderNumber);
 
-            var irId = irRec.save({
+            if (memo) {
+                trySet(irRec, 'memo', memo);
+            }
+
+            result.itemReceiptId = irRec.save({
                 enableSourcing: false,
                 ignoreMandatoryFields: true
             });
 
             result.success = true;
-            result.itemReceiptId = irId;
-            result.message = 'Consolidated Item Receipt created successfully from the Transfer Order.';
+            result.message = 'Consolidated Item Receipt created from the Transfer Order.';
 
         } catch (e) {
             log.error('ITEM RECEIPT CREATE FAILED', {
@@ -475,19 +592,108 @@ function (https, record, log, search) {
         return result;
     }
 
-    /*************************************************************
-     * JAZZ TOKEN
-     *************************************************************/
+    /* ======================================================================
+     * TRANSFER ORDER QUANTITY SEARCH
+     * Your saved search, grouped by item AND the SKU column so the totals key
+     * on the same value the IF lines match on. Falls back to item-only
+     * grouping if the custom column cannot be grouped.
+     * ====================================================================== */
+
+    function getToQtyBySku(toId) {
+        try {
+            return runToSearch(toId, true);
+        } catch (e) {
+            log.audit('TO SEARCH - SKU GROUPING FAILED, FALLING BACK TO ITEM', {
+                toId: toId,
+                message: e.message
+            });
+
+            try {
+                return runToSearch(toId, false);
+            } catch (e2) {
+                log.error('TO SEARCH FAILED', { toId: toId, message: e2.message });
+                return {}; // reconciliation still works off the IF lines
+            }
+        }
+    }
+
+    function runToSearch(toId, groupBySku) {
+        var columns = [
+            search.createColumn({ name: 'item', summary: search.Summary.GROUP }),
+            search.createColumn({
+                name: 'formulanumeric',
+                summary: search.Summary.SUM,
+                formula: 'ABS(NVL({quantity},0))'
+            })
+        ];
+
+        if (groupBySku) {
+            columns.splice(1, 0, search.createColumn({
+                name: LINE_SKU_FIELD,
+                summary: search.Summary.GROUP
+            }));
+        }
+
+        var s = search.create({
+            type: 'transferorder',
+            settings: [{ name: 'consolidationtype', value: 'ACCTTYPE' }],
+            filters: [
+                ['type', 'anyof', 'TrnfrOrd'], 'AND',
+                ['internalidnumber', 'equalto', String(toId)], 'AND',
+                ['mainline', 'is', 'F'], 'AND',
+                ['cogs', 'is', 'F'], 'AND',
+                ['shipping', 'is', 'F'], 'AND',
+                ['taxline', 'is', 'F'], 'AND',
+                ['transactionlinetype', 'anyof', 'ITEM']
+            ],
+            columns: columns
+        });
+
+        var out = {};
+        var paged = s.runPaged({ pageSize: 1000 });
+
+        paged.pageRanges.forEach(function (range) {
+            paged.fetch({ index: range.index }).data.forEach(function (r) {
+
+                var itemName = r.getText({ name: 'item', summary: search.Summary.GROUP }) ||
+                               r.getValue({ name: 'item', summary: search.Summary.GROUP });
+
+                var rawSku = groupBySku
+                    ? r.getValue({ name: LINE_SKU_FIELD, summary: search.Summary.GROUP })
+                    : itemName;
+
+                var sku = normalizeSku(rawSku || itemName);
+                if (!sku) return;
+
+                var qty = Number(r.getValue({
+                    name: 'formulanumeric',
+                    summary: search.Summary.SUM
+                }) || 0);
+
+                if (!out[sku]) {
+                    out[sku] = { sku: sku, itemName: itemName, qty: 0 };
+                }
+                out[sku].qty += qty;
+            });
+        });
+
+        return out;
+    }
+
+    /* ======================================================================
+     * JAZZ API
+     * ====================================================================== */
+
     function getJazzToken() {
         var resp = https.post({
-            url: 'https://' + JAZZ_DOMAIN + '/api/token/',
+            url: 'https://' + CONFIG.JAZZ_DOMAIN + '/api/token/',
             headers: {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             },
             body: JSON.stringify({
-                username: JAZZ_USERNAME,
-                password: JAZZ_PASSWORD
+                username: CONFIG.JAZZ_USERNAME,
+                password: CONFIG.JAZZ_PASSWORD
             })
         });
 
@@ -495,7 +701,7 @@ function (https, record, log, search) {
             throw new Error('Jazz token failed: ' + resp.code + ' - ' + resp.body);
         }
 
-        var body = JSON.parse(resp.body || '{}');
+        var body  = JSON.parse(resp.body || '{}');
         var token = body.token || body.key || body.access_token || body.auth_token;
 
         if (!token) {
@@ -505,23 +711,20 @@ function (https, record, log, search) {
         return token;
     }
 
-    /*************************************************************
-     * GET ALL JAZZ SHIPMENTS WITH PAGINATION
-     *************************************************************/
     function getAllJazzShipments(token, orderNumber) {
         var all = [];
         var offset = 0;
-        var safety = 0;
+        var page = 0;
         var nextUrl = buildJazzShipmentUrl(orderNumber, offset);
 
-        while (nextUrl && safety < 100) {
-            safety++;
+        while (nextUrl && page < CONFIG.JAZZ_MAX_PAGES) {
+            page++;
 
             var resp = https.get({
                 url: nextUrl,
                 headers: {
                     'Accept': 'application/json',
-                    'Tenant': JAZZ_TENANT,
+                    'Tenant': CONFIG.JAZZ_TENANT,
                     'Authorization': 'Token ' + token
                 }
             });
@@ -538,12 +741,14 @@ function (https, record, log, search) {
             }
 
             log.audit('JAZZ PAGE READ', {
-                page: safety,
+                page: page,
                 rowsThisPage: rows.length,
-                totalRowsSoFar: all.length
+                totalSoFar: all.length
             });
 
-            if (body.next) {
+            if (rows.length === 0) {
+                nextUrl = '';
+            } else if (body.next) {
                 nextUrl = normalizeJazzNextUrl(body.next);
             } else if (body.count && all.length < Number(body.count)) {
                 offset = all.length;
@@ -551,24 +756,18 @@ function (https, record, log, search) {
             } else {
                 nextUrl = '';
             }
-
-            if (rows.length === 0) {
-                nextUrl = '';
-            }
         }
 
-        if (safety >= 100) {
-            log.error('JAZZ PAGINATION STOPPED BY SAFETY LIMIT', {
-                totalRows: all.length
-            });
+        if (page >= CONFIG.JAZZ_MAX_PAGES) {
+            log.error('JAZZ PAGINATION HIT SAFETY LIMIT', { totalRows: all.length });
         }
 
         return all;
     }
 
     function buildJazzShipmentUrl(orderNumber, offset) {
-        return 'https://' + JAZZ_DOMAIN +
-            '/api/v1/shipment/status?limit=' + JAZZ_PAGE_LIMIT +
+        return 'https://' + CONFIG.JAZZ_DOMAIN +
+            '/api/v1/shipment/status?limit=' + CONFIG.JAZZ_PAGE_LIMIT +
             '&offset=' + Number(offset || 0) +
             '&order_number=' + encodeURIComponent(orderNumber);
     }
@@ -578,48 +777,38 @@ function (https, record, log, search) {
 
         nextValue = String(nextValue);
 
-        if (nextValue.indexOf('http') === 0) {
-            return nextValue;
-        }
+        if (nextValue.indexOf('http') === 0) return nextValue;
+        if (nextValue.indexOf('/') === 0) return 'https://' + CONFIG.JAZZ_DOMAIN + nextValue;
 
-        if (nextValue.indexOf('/') === 0) {
-            return 'https://' + JAZZ_DOMAIN + nextValue;
-        }
-
-        return 'https://' + JAZZ_DOMAIN + '/' + nextValue;
+        return 'https://' + CONFIG.JAZZ_DOMAIN + '/' + nextValue;
     }
 
     function getRowsFromJazzBody(body) {
         if (!body) return [];
-
-        if (body.results && Array.isArray(body.results)) {
-            return body.results;
-        }
-
-        if (body.shipments && Array.isArray(body.shipments)) {
-            return body.shipments;
-        }
-
-        if (body.data && Array.isArray(body.data)) {
-            return body.data;
-        }
-
-        if (Array.isArray(body)) {
-            return body;
-        }
-
+        if (Array.isArray(body)) return body;
+        if (Array.isArray(body.results))   return body.results;
+        if (Array.isArray(body.shipments)) return body.shipments;
+        if (Array.isArray(body.data))      return body.data;
         return [];
     }
 
-    /*************************************************************
-     * BUILD ONE CONSOLIDATED ROW FOR THE ENTIRE ORDER
-     * - row.cartons: [{ cartonNumber, trackingNumber, weight, shipDate }, ...]
-     * - row.requiredQtyBySku: { SKU: totalQtyAcrossAllCartons, ... }
-     *************************************************************/
-    function buildConsolidatedRow(shipments) {
-        var cartonMap = {};       // cartonNumber -> { cartonNumber, trackingNumber, weight, shipDate }
-        var requiredQtyBySku = {};
-        var totalQty = 0;
+    /* ======================================================================
+     * JAZZ SUMMARISATION
+     *
+     * Two passes on purpose:
+     *   shipped   - only from eligible (confirmed/shipped/closed) shipments
+     *   cancelled - from EVERY shipment, including cancelled ones, otherwise a
+     *               wholly cancelled shipment never reaches the memo
+     * ====================================================================== */
+
+    function summariseJazzShipments(shipments) {
+        var cartonMap = {};
+        var shippedQtyBySku = {};
+        var cancelledQtyBySku = {};
+
+        var totalShippedQty = 0;
+        var totalCancelledQty = 0;
+
         var primaryTrackingNumber = '';
         var primaryShipmentNumber = '';
         var earliestShipDate = '';
@@ -628,87 +817,73 @@ function (https, record, log, search) {
         for (var i = 0; i < shipments.length; i++) {
             var shipment = shipments[i];
 
-            if (!isEligibleShipment(shipment)) {
-                continue;
-            }
+            var details = shipment.shipment_detail ||
+                          shipment.shipment_details ||
+                          shipment.details || [];
 
-            var shipmentNumber = getShipmentNumber(shipment);
-            var trackingNumber = getTrackingNumber(shipment);
-            var shipmentCartonNumber = getCartonNumber(shipment);
-            var shipDate = getShipmentDate(shipment);
-            var weight = getShipmentWeight(shipment);
+            if (!details.length) continue;
 
-            if (!primaryTrackingNumber && trackingNumber) {
-                primaryTrackingNumber = trackingNumber;
-            }
-            if (!primaryShipmentNumber && shipmentNumber) {
-                primaryShipmentNumber = shipmentNumber;
-            }
+            var eligible          = isEligibleShipment(shipment);
+            var shipmentNumber    = getShipmentNumber(shipment);
+            var trackingNumber    = getTrackingNumber(shipment);
+            var shipmentCartonNo  = getCartonNumber(shipment);
+            var shipmentDate      = getShipmentDate(shipment);
+            var weight            = getShipmentWeight(shipment);
 
-            var details = shipment.shipment_detail || shipment.shipment_details || shipment.details || [];
+            if (eligible) {
+                if (!primaryTrackingNumber && trackingNumber) primaryTrackingNumber = trackingNumber;
+                if (!primaryShipmentNumber && shipmentNumber) primaryShipmentNumber = shipmentNumber;
+            }
 
             for (var d = 0; d < details.length; d++) {
                 var detail = details[d];
-
-                if (isCancelledDetail(detail)) {
-                    continue;
-                }
-
                 var sku = normalizeSku(getDetailSku(detail));
+
+                if (!sku) continue;
+
+                /* ---- cancelled: captured from every shipment ---- */
+                var cancelledQty = getDetailCancelledQty(detail);
+
+                if (cancelledQty > 0) {
+                    addQty(cancelledQtyBySku, sku, cancelledQty);
+                    totalCancelledQty += cancelledQty;
+                }
+
+                if (!eligible) continue;
+
+                /* ---- shipped ---- */
                 var qty = getDetailShippedQty(detail);
+                if (qty <= 0) continue;
 
-                if (!sku || qty <= 0) {
-                    continue;
-                }
+                var cartonNumber = String(
+                    getCartonNumber(detail) ||
+                    shipmentCartonNo ||
+                    shipmentNumber ||
+                    trackingNumber || ''
+                ).trim();
 
-                var detailCartonNumber = getCartonNumber(detail);
-                var detailShipDate = getShipmentDate(detail);
+                var finalShipDate = getShipmentDate(detail) || shipmentDate;
 
-                var cartonNumber = detailCartonNumber || shipmentCartonNumber;
-
-                if (!cartonNumber) {
-                    cartonNumber = shipmentNumber || trackingNumber;
-                }
-
-                cartonNumber = String(cartonNumber || '').trim();
-
-                var finalShipDate = detailShipDate || shipDate;
-
-                // --- Track this carton (for package lines) ---
                 if (!cartonMap[cartonNumber]) {
                     cartonMap[cartonNumber] = {
                         cartonNumber: cartonNumber,
                         trackingNumber: trackingNumber,
                         weight: weight,
                         shipDate: finalShipDate,
-                        items: []
+                        totalQty: 0
                     };
                 } else {
-                    if (!cartonMap[cartonNumber].trackingNumber && trackingNumber) {
-                        cartonMap[cartonNumber].trackingNumber = trackingNumber;
-                    }
-                    if (!cartonMap[cartonNumber].weight && weight) {
-                        cartonMap[cartonNumber].weight = weight;
-                    }
-                    if (!cartonMap[cartonNumber].shipDate && finalShipDate) {
-                        cartonMap[cartonNumber].shipDate = finalShipDate;
-                    }
+                    var carton = cartonMap[cartonNumber];
+                    if (!carton.trackingNumber && trackingNumber) carton.trackingNumber = trackingNumber;
+                    if (!carton.weight && weight)                 carton.weight = weight;
+                    if (!carton.shipDate && finalShipDate)        carton.shipDate = finalShipDate;
                 }
 
-                // --- Track this carton's own SKU/qty (per-carton, NOT summed) ---
-                cartonMap[cartonNumber].items.push({
-                    sku: sku,
-                    qty: qty
-                });
+                cartonMap[cartonNumber].totalQty += qty;
 
-                // --- Sum item qty by SKU across ALL cartons ---
-                if (!requiredQtyBySku[sku]) {
-                    requiredQtyBySku[sku] = 0;
-                }
-                requiredQtyBySku[sku] += qty;
-                totalQty += qty;
+                addQty(shippedQtyBySku, sku, qty);
+                totalShippedQty += qty;
 
-                // --- Track earliest ship date for header dates ---
                 if (finalShipDate) {
                     var parsed = parseJazzDate(finalShipDate);
                     if (parsed) {
@@ -724,17 +899,15 @@ function (https, record, log, search) {
 
         var cartons = [];
         for (var key in cartonMap) {
-            if (cartonMap.hasOwnProperty(key)) {
-                cartons.push(cartonMap[key]);
-            }
+            if (cartonMap.hasOwnProperty(key)) cartons.push(cartonMap[key]);
         }
 
         return {
-            toId: TO_ID,
-            wmsOrderNumber: WMS_ORDER_NUMBER,
             cartons: cartons,
-            requiredQtyBySku: requiredQtyBySku,
-            totalQty: totalQty,
+            shippedQtyBySku: shippedQtyBySku,
+            cancelledQtyBySku: cancelledQtyBySku,
+            totalShippedQty: totalShippedQty,
+            totalCancelledQty: totalCancelledQty,
             primaryTrackingNumber: primaryTrackingNumber,
             primaryShipmentNumber: primaryShipmentNumber,
             earliestShipDate: earliestShipDate
@@ -743,204 +916,139 @@ function (https, record, log, search) {
 
     function isEligibleShipment(shipment) {
         var status = String(
-            shipment.status ||
-            shipment.shipment_status ||
-            shipment.order_status ||
-            ''
+            shipment.status || shipment.shipment_status || shipment.order_status || ''
         ).toLowerCase();
 
-        var details = shipment.shipment_detail || shipment.shipment_details || shipment.details || [];
-
-        if (!details || details.length <= 0) {
-            return false;
-        }
-
-        return (
-            status === 'confirmed' ||
-            status === 'shipped' ||
-            status === 'closed'
-        );
+        return status === 'confirmed' || status === 'shipped' || status === 'closed';
     }
 
-    function isCancelledDetail(detail) {
+    /**
+     * Explicit cancelled qty wins. If the line is flagged cancelled but carries
+     * no cancelled number, fall back to ordered-minus-shipped.
+     */
+    function getDetailCancelledQty(detail) {
+        var explicit = firstNumber([
+            detail.qty_cancelled,
+            detail.cancelled_qty,
+            detail.canceled_qty,
+            detail.quantity_cancelled
+        ]);
+
+        if (explicit > 0) return explicit;
+
         var status = String(
-            detail.status ||
-            detail.line_status ||
-            detail.cancel_status ||
-            ''
+            detail.status || detail.line_status || detail.cancel_status || ''
         ).toLowerCase();
 
-        if (status.indexOf('cancel') !== -1) {
-            return true;
-        }
+        if (status.indexOf('cancel') === -1) return 0;
 
-        var cancelledQty = Number(
-            detail.qty_cancelled ||
-            detail.cancelled_qty ||
-            detail.quantity_cancelled ||
-            0
-        );
+        var ordered = firstNumber([
+            detail.qty_ordered,
+            detail.ordered_qty,
+            detail.quantity_ordered,
+            detail.qty,
+            detail.quantity
+        ]);
 
-        var shippedQty = getDetailShippedQty(detail);
+        var shipped = getDetailShippedQty(detail);
+        var gap = ordered - shipped;
 
-        if (cancelledQty > 0 && shippedQty <= 0) {
-            return true;
-        }
-
-        return false;
+        return gap > 0 ? gap : 0;
     }
 
     function getDetailSku(detail) {
-        return detail.sku_code ||
-            detail.sku ||
-            detail.item_sku ||
-            detail.item_number ||
-            detail.ItemNumber ||
-            '';
+        return detail.sku_code || detail.sku || detail.item_sku ||
+               detail.item_number || detail.ItemNumber || '';
     }
 
     function getDetailShippedQty(detail) {
-        var qty = detail.qty_shipped;
-
-        if (qty === null || qty === undefined || qty === '') {
-            qty = detail.shipped_qty;
-        }
-
-        if (qty === null || qty === undefined || qty === '') {
-            qty = detail.quantity_shipped;
-        }
-
-        if (qty === null || qty === undefined || qty === '') {
-            qty = detail.fulfilled_qty;
-        }
-
-        return Number(qty || 0);
+        return firstNumber([
+            detail.qty_shipped,
+            detail.shipped_qty,
+            detail.quantity_shipped,
+            detail.fulfilled_qty
+        ]);
     }
 
     function getShipmentNumber(shipment) {
         return String(
-            shipment.shipment_number ||
-            shipment.shipment_no ||
-            shipment.shipment_id ||
-            shipment.id ||
-            ''
+            shipment.shipment_number || shipment.shipment_no ||
+            shipment.shipment_id || shipment.id || ''
         ).trim();
     }
 
     function getTrackingNumber(shipment) {
         return String(
-            shipment.tracking_number ||
-            shipment.tracking_no ||
-            shipment.pro_number ||
-            shipment.master_tracking_number ||
-            ''
+            shipment.tracking_number || shipment.tracking_no ||
+            shipment.pro_number || shipment.master_tracking_number || ''
         ).trim();
     }
 
     function getCartonNumber(obj) {
+        if (!obj) return '';
         return String(
-            obj.carton_number ||
-            obj.carton_no ||
-            obj.carton ||
-            obj.carton_id ||
-            obj.package_number ||
-            obj.package_no ||
-            obj.package_id ||
-            obj.box_number ||
-            obj.box_no ||
-            obj.container_number ||
-            ''
+            obj.carton_number || obj.carton_no || obj.carton || obj.carton_id ||
+            obj.package_number || obj.package_no || obj.package_id ||
+            obj.box_number || obj.box_no || obj.container_number || ''
         ).trim();
     }
 
     function getShipmentWeight(shipment) {
-        return Number(
-            shipment.weight ||
-            shipment.shipment_weight ||
-            shipment.package_weight ||
-            0
-        );
+        return firstNumber([
+            shipment.weight, shipment.shipment_weight, shipment.package_weight
+        ]);
     }
 
-    /*************************************************************
-     * DATE HELPERS
-     *************************************************************/
     function getShipmentDate(obj) {
         if (!obj) return '';
-
-        return obj.ship_date ||
-            obj.shipped_date ||
-            obj.shipment_date ||
-            obj.date_shipped ||
-            obj.shipped_at ||
-            obj.shipment_date_time ||
-            obj.created_at ||
-            '';
+        return obj.ship_date || obj.shipped_date || obj.shipment_date ||
+               obj.date_shipped || obj.shipped_at || obj.shipment_date_time ||
+               obj.created_at || '';
     }
 
     function parseJazzDate(value) {
-        if (!value) {
-            return null;
-        }
+        if (!value) return null;
 
         value = String(value).trim();
 
         var m = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
-
         if (m) {
-            return new Date(
-                Number(m[1]),
-                Number(m[2]) - 1,
-                Number(m[3])
-            );
+            return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
         }
 
         var d = new Date(value);
-
         if (isNaN(d.getTime())) {
-            log.debug('Invalid Jazz shipment date', value);
+            log.debug('Invalid Jazz date', value);
             return null;
         }
 
         return d;
     }
 
-    /*************************************************************
+    /* ======================================================================
      * DUPLICATE CHECK
-     * Duplicate key = TO + WMS Order Number ONLY
-     * (there should only ever be ONE consolidated IF per WMS order now)
-     *************************************************************/
+     * ====================================================================== */
+
     function findExistingItemFulfillment(toId, wmsOrderNumber) {
-        var out = {
-            found: false,
-            id: '',
-            tranid: ''
-        };
+        var out = { found: false, id: '', tranid: '' };
 
-        if (!wmsOrderNumber) {
-            return out;
-        }
+        if (!wmsOrderNumber) return out;
 
-        var s = search.create({
+        search.create({
             type: 'itemfulfillment',
             filters: [
-                ['type', 'anyof', 'ItemShip'],
-                'AND',
-                ['mainline', 'is', 'T'],
-                'AND',
-                ['createdfrom', 'anyof', String(toId)],
-                'AND',
+                ['type', 'anyof', 'ItemShip'], 'AND',
+                ['mainline', 'is', 'T'], 'AND',
+                ['createdfrom', 'anyof', String(toId)], 'AND',
                 [BODY_WMS_ORDER_NUMBER, 'is', String(wmsOrderNumber)]
             ],
             columns: [
                 search.createColumn({ name: 'internalid' }),
                 search.createColumn({ name: 'tranid' })
             ]
-        });
-
-        s.run().each(function (r) {
-            out.found = true;
-            out.id = r.getValue({ name: 'internalid' });
+        }).run().each(function (r) {
+            out.found  = true;
+            out.id     = r.getValue({ name: 'internalid' });
             out.tranid = r.getValue({ name: 'tranid' });
             return false;
         });
@@ -948,9 +1056,10 @@ function (https, record, log, search) {
         return out;
     }
 
-    /*************************************************************
-     * LINE MATCHING HELPERS
-     *************************************************************/
+    /* ======================================================================
+     * LINE + PACKAGE HELPERS
+     * ====================================================================== */
+
     function getLineSku(ifRec, line) {
         var sku = '';
 
@@ -960,7 +1069,7 @@ function (https, record, log, search) {
                 fieldId: LINE_SKU_FIELD,
                 line: line
             });
-        } catch (e1) {}
+        } catch (e) { /* custom column absent on this line */ }
 
         if (!sku) {
             try {
@@ -969,7 +1078,7 @@ function (https, record, log, search) {
                     fieldId: 'item',
                     line: line
                 });
-            } catch (e2) {}
+            } catch (e2) { /* ignore */ }
         }
 
         return normalizeSku(sku);
@@ -992,85 +1101,61 @@ function (https, record, log, search) {
                 value: value
             });
         } catch (e) {
-            log.debug('itemreceive set failed', {
-                line: line,
-                value: value,
-                error: e.message
-            });
+            log.debug('itemreceive set failed', { line: line, value: value, error: e.message });
         }
     }
 
-    /*************************************************************
-     * PACKAGE HELPERS
-     * addOnePackageLine now takes an explicit "line" index so it can
-     * be called once per carton to build up multiple package lines.
-     *************************************************************/
     function clearPackageLines(ifRec) {
         try {
-            var count = ifRec.getLineCount({
-                sublistId: 'package'
-            });
-
+            var count = ifRec.getLineCount({ sublistId: 'package' });
             for (var i = count - 1; i >= 0; i--) {
-                ifRec.removeLine({
-                    sublistId: 'package',
-                    line: i
-                });
+                ifRec.removeLine({ sublistId: 'package', line: i });
             }
         } catch (e) {
             log.debug('clearPackageLines failed', e.message);
         }
     }
 
-    function addOnePackageLine(ifRec, lineIndex, trackingNumber, cartonNumber, weight) {
+    function addOnePackageLine(ifRec, lineIndex, carton) {
         try {
-            ifRec.insertLine({
-                sublistId: 'package',
-                line: lineIndex
-            });
+            ifRec.insertLine({ sublistId: 'package', line: lineIndex });
 
-            trySetSub(ifRec, 'package', 'packagetrackingnumber', lineIndex, trackingNumber);
-            trySetSub(ifRec, 'package', 'packagedescr', lineIndex, cartonNumber);
+            trySetSub(ifRec, 'package', 'packagetrackingnumber', lineIndex, carton.trackingNumber);
+            trySetSub(ifRec, 'package', 'packagedescr',          lineIndex, carton.cartonNumber);
 
-            if (weight) {
-                trySetSub(ifRec, 'package', 'packageweight', lineIndex, Number(weight));
+            if (carton.weight) {
+                trySetSub(ifRec, 'package', 'packageweight', lineIndex, Number(carton.weight));
             }
+
+            return true;
+
         } catch (e) {
-            log.debug('addOnePackageLine failed', {
+            log.error('PACKAGE LINE FAILED', {
                 lineIndex: lineIndex,
-                trackingNumber: trackingNumber,
-                cartonNumber: cartonNumber,
+                cartonNumber: carton.cartonNumber,
+                trackingNumber: carton.trackingNumber,
                 error: e.message
             });
+            return false;
         }
     }
 
-    /*************************************************************
+    /* ======================================================================
      * COMMON HELPERS
-     *************************************************************/
+     * ====================================================================== */
+
     function trySet(rec, fieldId, value) {
-        if (!fieldId || value === null || value === undefined || value === '') {
-            return;
-        }
+        if (!fieldId || value === null || value === undefined || value === '') return;
 
         try {
-            rec.setValue({
-                fieldId: fieldId,
-                value: value
-            });
+            rec.setValue({ fieldId: fieldId, value: value });
         } catch (e) {
-            log.debug('header set failed', {
-                fieldId: fieldId,
-                value: value,
-                error: e.message
-            });
+            log.debug('header set failed', { fieldId: fieldId, error: e.message });
         }
     }
 
     function trySetSub(rec, sublistId, fieldId, line, value) {
-        if (!fieldId || value === null || value === undefined || value === '') {
-            return;
-        }
+        if (!fieldId || value === null || value === undefined || value === '') return;
 
         try {
             rec.setSublistValue({
@@ -1081,19 +1166,13 @@ function (https, record, log, search) {
             });
         } catch (e) {
             log.debug('sublist set failed', {
-                sublistId: sublistId,
-                fieldId: fieldId,
-                line: line,
-                value: value,
-                error: e.message
+                sublistId: sublistId, fieldId: fieldId, line: line, error: e.message
             });
         }
     }
 
     function normalizeSku(value) {
-        value = String(value || '').trim();
-
-        value = value.replace(/\s+/g, '');
+        value = String(value || '').trim().replace(/\s+/g, '');
 
         if (value.indexOf(':') !== -1) {
             value = value.replace(/:/g, '_');
@@ -1102,41 +1181,58 @@ function (https, record, log, search) {
         return value.toUpperCase();
     }
 
-    function copyObj(obj) {
-        var out = {};
+    function addQty(map, key, qty) {
+        if (!key) return;
+        map[key] = Number(map[key] || 0) + Number(qty || 0);
+    }
 
-        for (var k in obj) {
-            if (obj.hasOwnProperty(k)) {
-                out[k] = obj[k];
+    function firstNumber(candidates) {
+        for (var i = 0; i < candidates.length; i++) {
+            var v = candidates[i];
+            if (v !== null && v !== undefined && v !== '') {
+                var n = Number(v);
+                if (!isNaN(n)) return n;
             }
         }
+        return 0;
+    }
 
+    function copyObj(obj) {
+        var out = {};
+        for (var k in obj) {
+            if (obj.hasOwnProperty(k)) out[k] = obj[k];
+        }
         return out;
     }
 
-    /*************************************************************
-     * SUMMARY
-     *************************************************************/
+    function sumBucket(rows) {
+        var total = 0;
+        for (var i = 0; i < rows.length; i++) {
+            total += Number(rows[i].qty || 0);
+        }
+        return total;
+    }
+
+    function byQtyDesc(a, b) {
+        return Number(b.qty || 0) - Number(a.qty || 0);
+    }
+
+    /* ======================================================================
+     * SUMMARIZE
+     * ====================================================================== */
+
     function summarize(summary) {
-        var created = 0;
-        var createdIfOnlyReceiptFailed = 0;
-        var skipped = 0;
-        var duplicateSkipped = 0;
-        var errors = 0;
+        var counts = {
+            CREATED: 0,
+            CREATED_IF_ONLY_RECEIPT_FAILED: 0,
+            SKIPPED: 0,
+            DUPLICATE_SKIPPED: 0,
+            ERROR: 0
+        };
 
         summary.output.iterator().each(function (key, value) {
-            if (key === 'CREATED') {
-                created++;
-            } else if (key === 'CREATED_IF_ONLY_RECEIPT_FAILED') {
-                createdIfOnlyReceiptFailed++;
-            } else if (key === 'SKIPPED') {
-                skipped++;
-            } else if (key === 'DUPLICATE_SKIPPED') {
-                duplicateSkipped++;
-            } else if (key === 'ERROR') {
-                errors++;
-            }
-
+            if (counts.hasOwnProperty(key)) counts[key]++;
+            log.audit('OUTPUT ' + key, value);
             return true;
         });
 
@@ -1144,17 +1240,13 @@ function (https, record, log, search) {
             usage: summary.usage,
             concurrency: summary.concurrency,
             yields: summary.yields,
-            created: created,
-            createdIfOnlyReceiptFailed: createdIfOnlyReceiptFailed,
-            skipped: skipped,
-            duplicateSkipped: duplicateSkipped,
-            errors: errors
+            counts: counts
         });
 
-        if (createdIfOnlyReceiptFailed > 0) {
-            log.error('ATTENTION - ITEM FULFILLMENT(S) CREATED WITHOUT A RECEIPT', {
-                count: createdIfOnlyReceiptFailed,
-                note: 'Check ITEM RECEIPT FAILED entries above for the reason and create the receipt manually if needed.'
+        if (counts.CREATED_IF_ONLY_RECEIPT_FAILED > 0) {
+            log.error('ATTENTION - IF CREATED WITHOUT A RECEIPT', {
+                count: counts.CREATED_IF_ONLY_RECEIPT_FAILED,
+                note: 'See ITEM RECEIPT FAILED entries above. Create the receipt manually.'
             });
         }
 
