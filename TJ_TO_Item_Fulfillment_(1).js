@@ -12,8 +12,8 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
 
     var CONFIG = {
         TO_ID: 142435642, WMS_ORDER_NUMBER: 'TOMFBA143320390',
-        JAZZ_DOMAIN: 'fbflurry.jazz-oms.com', JAZZ_USERNAME: 'Dsoni',
-        JAZZ_PASSWORD: 'OnCloud2026!!', JAZZ_TENANT: 'TMJ',
+        JAZZ_DOMAIN: 'fbflurry-uat01.jazz-oms.com', JAZZ_USERNAME: 'dsoni',
+        JAZZ_PASSWORD: 'tW4Ffe!EdLWpQfkD', JAZZ_TENANT: 'TMJ',
         JAZZ_PAGE_LIMIT: 250, JAZZ_MAX_PAGES: 100
     };
 
