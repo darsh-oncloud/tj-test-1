@@ -117,9 +117,18 @@ function (https, record, log, search, runtime) {
 
         try {
             var res = JSON.parse(context.value);
-            var toId = String(res.id || '');
 
-            if (!toId) { log.error('MAP - NO INTERNAL ID ON SEARCH ROW', context.value); return; }
+            // On a GROUP/summary search result.id is not the TO id - the id is only in the
+            // grouped internalid column. Prefer the column, fall back to result.id.
+            var toId = extractResultValue(res, 'internalid') || String(res.id || '');
+
+            if (toId === '0') toId = '';   // summary rows carry a placeholder id of 0
+
+            if (!toId) {
+                log.error('MAP - NO INTERNAL ID ON SEARCH ROW', { row: context.value,
+                    hint: 'Add Internal ID as a result column on the saved search.' });
+                return;
+            }
 
             var wms = extractResultValue(res, BODY_WMS_ORDER_NUMBER);
             var tranid = extractResultValue(res, 'tranid');
@@ -191,9 +200,14 @@ function (https, record, log, search, runtime) {
         return out;
     }
 
-    /** Saved search values arrive as a string or { value, text }. Column keys can carry suffixes. */
+    /**
+     * Saved search values arrive as a string or { value, text }.
+     * Summary searches wrap the key: GROUP(internalid), SUM(quantity), MAX(trandate) and so on.
+     * Strip the wrapper before matching so the same code handles grouped and ungrouped searches.
+     */
     function extractResultValue(res, fieldId) {
         var values = res.values || {};
+        var target = String(fieldId).toLowerCase();
         var key, raw;
 
         if (values.hasOwnProperty(fieldId)) raw = values[fieldId];
@@ -201,18 +215,27 @@ function (https, record, log, search, runtime) {
         if (raw === undefined) {
             for (key in values) {
                 if (!values.hasOwnProperty(key)) continue;
-                if (String(key).toLowerCase().indexOf(String(fieldId).toLowerCase()) === 0) {
-                    raw = values[key];
-                    break;
-                }
+                if (stripSummaryWrapper(key) === target) { raw = values[key]; break; }
             }
         }
 
         if (raw === undefined || raw === null) return '';
-        if (Array.isArray(raw)) return raw.length ? String(raw[0].text || raw[0].value || '').trim() : '';
-        if (typeof raw === 'object') return String(raw.text || raw.value || '').trim();
+        if (Array.isArray(raw)) return raw.length ? String(raw[0].value || raw[0].text || '').trim() : '';
+        if (typeof raw === 'object') return String(raw.value || raw.text || '').trim();
 
         return String(raw).trim();
+    }
+
+    /** "GROUP(custbody_wms_order_number)" -> "custbody_wms_order_number" */
+    function stripSummaryWrapper(key) {
+        key = String(key || '').toLowerCase().trim();
+
+        var open = key.indexOf('(');
+        var close = key.lastIndexOf(')');
+
+        if (open > -1 && close > open) key = key.substring(open + 1, close);
+
+        return key.trim();
     }
 
     /* ================= REDUCE ================= */
