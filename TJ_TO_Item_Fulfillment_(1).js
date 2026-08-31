@@ -2,20 +2,59 @@
  * @NApiVersion 2.1
  * @NScriptType MapReduceScript
  *
- * TO -> 1 consolidated Item Fulfillment + 1 Item Receipt.
- * Jazz shipment/status = what shipped (per carton). Jazz order/status = qty_canceled (one "l").
- * Qty is pooled by SKU across all cartons, then allocated top-down across IF lines.
- * Memo: CANCELLED(JAZZ) | SHORT(NOT SHIPPED) | EXTRA(JAZZ>TO), capped at 999 chars.
+ * ONE script, TWO deployments. No manual TO id / WMS number in code - both come from a saved search.
+ *
+ *   Deployment 1  MODE = FULFILLMENT
+ *       Search returns TOs pending fulfillment. For each row (TO internal id + WMS order number +
+ *       document number) it calls Jazz and creates ONE consolidated Item Fulfillment - identical
+ *       logic to the original combined script.
+ *
+ *   Deployment 2  MODE = RECEIPT
+ *       Search returns TOs where the "Create Item Receipt" checkbox is ticked.
+ *       For each TO it finds EVERY Item Fulfillment that still has outstanding quantity and creates
+ *       one Item Receipt per fulfillment. No Jazz call. Checkbox is unticked in summarize.
+ *
+ *       WHY PER FULFILLMENT: a plain TO -> ItemRecpt transform builds receipt lines per fulfillment.
+ *       With 800 fulfillments on one TO that sublist is unusable and the save will time out.
+ *       Scoping the transform with defaultValues.itemfulfillment keeps each receipt small, and
+ *       because each fulfillment is its own Map/Reduce key the script yields between them.
+ *
+ * Script parameters (set per deployment):
+ *   custscript_jz_mode          Free-Form Text. "FULFILLMENT" or "RECEIPT".
+ *   custscript_jz_search_id     Free-Form Text. Saved search script id (customsearch_xxx) or internal id.
+ *   custscript_jz_password      Password. Jazz password. FULFILLMENT only.
+ *   custscript_jz_clear_field   Free-Form Text. Body checkbox to untick after a clean run. RECEIPT only.
+ *
+ * Saved search requirements (both):
+ *   Type = Transaction. Criteria: Type = Transfer Order AND Main Line = true.
+ *   Result columns MUST include the WMS order number field. Document Number is optional (logging only).
  */
-define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, log, search) {
+define(['N/https', 'N/record', 'N/log', 'N/search', 'N/runtime'],
+function (https, record, log, search, runtime) {
     'use strict';
 
+    /* ================= CONFIG ================= */
+
     var CONFIG = {
-        TO_ID: 142435642, WMS_ORDER_NUMBER: 'TOMFBA143320390',
-        JAZZ_DOMAIN: 'fbflurry-uat01.jazz-oms.com', JAZZ_USERNAME: 'dsoni',
-        JAZZ_PASSWORD: 'tW4Ffe!EdLWpQfkD', JAZZ_TENANT: 'TMJ',
-        JAZZ_PAGE_LIMIT: 250, JAZZ_MAX_PAGES: 100
+        JAZZ_DOMAIN: 'fbflurry-uat01.jazz-oms.com',
+        JAZZ_USERNAME: 'dsoni',
+        JAZZ_PASSWORD: '',              // leave blank - supply via custscript_jz_password
+        JAZZ_TENANT: 'TMJ',
+        JAZZ_PAGE_LIMIT: 250,
+        JAZZ_MAX_PAGES: 100
     };
+
+    var PARAM = {
+        MODE: 'custscript_jz_mode',
+        SEARCH_ID: 'custscript_jz_search_id',
+        JAZZ_PASSWORD: 'custscript_jz_password',
+        CLEAR_FIELD: 'custscript_jz_clear_field'
+    };
+
+    var MODE_FULFILLMENT = 'FULFILLMENT';
+    var MODE_RECEIPT = 'RECEIPT';
+
+    var NO_IF_PREFIX = 'NOIF-';         // reduce key marker for "TO had nothing to receive"
 
     var DEBUG_JAZZ_FIELDS = true;
 
@@ -27,20 +66,258 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
     var BODY_JAZZ_SHIPMENT_NUMBER = 'custbody_jazz_shipment_number';
     var MAX_MEMO_LENGTH = 999;
 
+    var _tokenCache = null;
+
+    /* ================= DEPLOYMENT CONFIG ================= */
+
+    function getDeploymentConfig() {
+        var script = runtime.getCurrentScript();
+
+        var mode = String(script.getParameter({ name: PARAM.MODE }) || '').trim().toUpperCase();
+
+        if (mode === 'IF' || mode.indexOf('FULFIL') === 0) mode = MODE_FULFILLMENT;
+        if (mode === 'IR' || mode.indexOf('RECEI') === 0) mode = MODE_RECEIPT;
+
+        return {
+            mode: mode,
+            searchId: String(script.getParameter({ name: PARAM.SEARCH_ID }) || '').trim(),
+            clearField: String(script.getParameter({ name: PARAM.CLEAR_FIELD }) || '').trim(),
+            jazzPassword: String(script.getParameter({ name: PARAM.JAZZ_PASSWORD }) || '').trim()
+                || CONFIG.JAZZ_PASSWORD,
+            deploymentId: script.deploymentId
+        };
+    }
+
+    function validateConfig(cfg) {
+        if (cfg.mode !== MODE_FULFILLMENT && cfg.mode !== MODE_RECEIPT)
+            throw new Error('Parameter ' + PARAM.MODE + ' must be FULFILLMENT or RECEIPT. Got: "' + cfg.mode + '"');
+
+        if (!cfg.searchId)
+            throw new Error('Parameter ' + PARAM.SEARCH_ID + ' is empty. Set the saved search id on this deployment.');
+
+        if (cfg.mode === MODE_FULFILLMENT && !cfg.jazzPassword)
+            throw new Error('Jazz password missing. Set ' + PARAM.JAZZ_PASSWORD + ' on this deployment.');
+    }
+
     /* ================= GET INPUT DATA ================= */
 
     function getInputData() {
-        log.audit('INPUT START', { toId: CONFIG.TO_ID, wmsOrderNumber: CONFIG.WMS_ORDER_NUMBER });
+        var cfg = getDeploymentConfig();
+        validateConfig(cfg);
 
-        var token = getJazzToken();
-        var shipments = getAllJazzShipments(token, CONFIG.WMS_ORDER_NUMBER);
+        log.audit('INPUT START', { mode: cfg.mode, searchId: cfg.searchId, deployment: cfg.deploymentId });
+
+        return search.load({ id: cfg.searchId });
+    }
+
+    /* ================= MAP ================= */
+
+    function map(context) {
+        var cfg = getDeploymentConfig();
+
+        try {
+            var res = JSON.parse(context.value);
+            var toId = String(res.id || '');
+
+            if (!toId) { log.error('MAP - NO INTERNAL ID ON SEARCH ROW', context.value); return; }
+
+            var wms = extractResultValue(res, BODY_WMS_ORDER_NUMBER);
+            var tranid = extractResultValue(res, 'tranid');
+
+            if (cfg.mode === MODE_FULFILLMENT) {
+                // one key per TO - duplicate search rows collapse together
+                context.write({ key: toId,
+                    value: JSON.stringify({ toId: toId, wmsOrderNumber: wms, tranid: tranid }) });
+                return;
+            }
+
+            // RECEIPT: fan the TO out into one key per outstanding Item Fulfillment
+            var fulfillments = findFulfillmentsToReceive(toId);
+
+            log.audit('RECEIPT - FULFILLMENTS FOUND', { toId: toId, tranid: tranid,
+                wmsOrderNumber: wms, count: fulfillments.length });
+
+            if (!fulfillments.length) {
+                context.write({ key: NO_IF_PREFIX + toId,
+                    value: JSON.stringify({ toId: toId, wmsOrderNumber: wms, tranid: tranid }) });
+                return;
+            }
+
+            for (var i = 0; i < fulfillments.length; i++) {
+                context.write({ key: String(fulfillments[i].id), value: JSON.stringify({
+                    toId: toId, wmsOrderNumber: wms, tranid: tranid,
+                    itemFulfillmentId: fulfillments[i].id, ifTranid: fulfillments[i].tranid }) });
+            }
+
+        } catch (e) {
+            log.error('MAP ERROR', { mode: cfg.mode, value: context.value,
+                message: e.message, stack: e.stack });
+        }
+    }
+
+    /**
+     * Every Item Fulfillment created from this TO that still has stock in transit.
+     *
+     * NOTE ON THE STATUS FILTER: for Transfer Order fulfillments NetSuite reports "Shipped"
+     * (ItemShip:C) while goods are in transit and "Received" once fully received. If your account
+     * behaves differently and this returns nothing, delete the status line - the zero-quantity
+     * guard in reduce will still stop already-received fulfillments from being processed twice.
+     */
+    function findFulfillmentsToReceive(toId) {
+        var out = [];
+
+        var s = search.create({
+            type: 'itemfulfillment',
+            filters: [
+                ['type', 'anyof', 'ItemShip'], 'AND',
+                ['mainline', 'is', 'T'], 'AND',
+                ['createdfrom', 'anyof', String(toId)], 'AND',
+                ['status', 'anyof', 'ItemShip:C']
+            ],
+            columns: [
+                search.createColumn({ name: 'internalid', sort: search.Sort.ASC }),
+                search.createColumn({ name: 'tranid' })
+            ]
+        });
+
+        var paged = s.runPaged({ pageSize: 1000 });
+
+        paged.pageRanges.forEach(function (range) {
+            paged.fetch({ index: range.index }).data.forEach(function (r) {
+                out.push({ id: r.getValue({ name: 'internalid' }), tranid: r.getValue({ name: 'tranid' }) });
+            });
+        });
+
+        return out;
+    }
+
+    /** Saved search values arrive as a string or { value, text }. Column keys can carry suffixes. */
+    function extractResultValue(res, fieldId) {
+        var values = res.values || {};
+        var key, raw;
+
+        if (values.hasOwnProperty(fieldId)) raw = values[fieldId];
+
+        if (raw === undefined) {
+            for (key in values) {
+                if (!values.hasOwnProperty(key)) continue;
+                if (String(key).toLowerCase().indexOf(String(fieldId).toLowerCase()) === 0) {
+                    raw = values[key];
+                    break;
+                }
+            }
+        }
+
+        if (raw === undefined || raw === null) return '';
+        if (Array.isArray(raw)) return raw.length ? String(raw[0].text || raw[0].value || '').trim() : '';
+        if (typeof raw === 'object') return String(raw.text || raw.value || '').trim();
+
+        return String(raw).trim();
+    }
+
+    /* ================= REDUCE ================= */
+
+    function reduce(context) {
+        var cfg = getDeploymentConfig();
+        var payload = {};
+
+        try { payload = JSON.parse(context.values[0] || '{}'); } catch (e) { payload = {}; }
+
+        try {
+            var outcome;
+
+            if (cfg.mode === MODE_FULFILLMENT) {
+                outcome = handleFulfillment(cfg, payload);
+            } else if (String(context.key).indexOf(NO_IF_PREFIX) === 0) {
+                outcome = { status: 'SKIPPED', success: false, mode: MODE_RECEIPT, toId: payload.toId,
+                    tranid: payload.tranid, wmsOrderNumber: payload.wmsOrderNumber,
+                    message: 'Skipped - no Item Fulfillment on this TO is awaiting receipt.' };
+            } else {
+                outcome = handleReceipt(payload);
+            }
+
+            log.audit(cfg.mode + ' ' + outcome.status, outcome);
+            context.write({ key: outcome.status, value: JSON.stringify(outcome) });
+
+        } catch (e) {
+            log.error('REDUCE ERROR', { mode: cfg.mode, key: context.key, payload: payload,
+                message: e.message, stack: e.stack });
+            context.write({ key: 'ERROR', value: JSON.stringify({ mode: cfg.mode, toId: payload.toId,
+                tranid: payload.tranid, wmsOrderNumber: payload.wmsOrderNumber,
+                itemFulfillmentId: payload.itemFulfillmentId, message: e.message }) });
+        }
+    }
+
+    /* ================= MODE 1 - FULFILLMENT ================= */
+
+    function handleFulfillment(cfg, payload) {
+        var toId = payload.toId;
+        var wmsOrderNumber = payload.wmsOrderNumber;
+
+        var outcome = { status: 'SKIPPED', success: false, mode: MODE_FULFILLMENT, toId: toId,
+            tranid: payload.tranid, wmsOrderNumber: wmsOrderNumber, message: '' };
+
+        if (!wmsOrderNumber) {
+            outcome.message = 'Skipped - WMS order number is blank. Confirm the saved search returns ' +
+                BODY_WMS_ORDER_NUMBER + ' as a result column and the TO has it populated.';
+            log.error('FULFILLMENT - NO WMS ORDER NUMBER', outcome);
+            return outcome;
+        }
+
+        var existing = findExistingItemFulfillment(toId, wmsOrderNumber);
+
+        if (existing.found) {
+            outcome.status = 'DUPLICATE_SKIPPED';
+            outcome.existingItemFulfillmentId = existing.id;
+            outcome.existingTranId = existing.tranid;
+            outcome.message = 'Skipped - Item Fulfillment already exists for this TO / WMS order.';
+            return outcome;
+        }
+
+        var row = buildJazzRow(cfg, toId, wmsOrderNumber);
+
+        if (!row.cartons.length) {
+            outcome.message = 'Skipped - no eligible (confirmed) cartons found in Jazz for this WMS order.';
+            return outcome;
+        }
+
+        var result = createConsolidatedFulfillment(row);
+
+        outcome.success = result.success;
+        outcome.status = result.success ? 'IF_CREATED' : 'SKIPPED';
+        outcome.itemFulfillmentId = result.itemFulfillmentId;
+        outcome.fulfilledLineCount = result.fulfilledLineCount;
+        outcome.fulfilledQtyTotal = result.fulfilledQtyTotal;
+        outcome.packageLinesAdded = result.packageLinesAdded;
+        outcome.reconciliation = result.reconciliation;
+        outcome.memoTruncated = result.memoTruncated;
+        outcome.message = result.message;
+
+        return outcome;
+    }
+
+    function buildJazzRow(cfg, toId, wmsOrderNumber) {
+        var token = getJazzToken(cfg);
+
+        var shipments = getAllJazzShipments(token, wmsOrderNumber);
         var jazzShip = summariseJazzShipments(shipments);
-        var orders = getAllJazzOrders(token, CONFIG.WMS_ORDER_NUMBER);
-        var jazzOrder = summariseJazzOrders(orders);
-        var toQtyBySku = getToQtyBySku(CONFIG.TO_ID);
 
-        var row = {
-            toId: CONFIG.TO_ID, wmsOrderNumber: CONFIG.WMS_ORDER_NUMBER,
+        var orders = getAllJazzOrders(token, wmsOrderNumber);
+        var jazzOrder = summariseJazzOrders(orders);
+
+        var toQtyBySku = getToQtyBySku(toId);
+
+        log.audit('JAZZ SUMMARY', {
+            toId: toId, wmsOrderNumber: wmsOrderNumber,
+            shipmentsFromJazz: shipments.length, cartonsFound: jazzShip.cartons.length,
+            distinctShippedSku: Object.keys(jazzShip.shippedQtyBySku).length,
+            totalShippedQty: jazzShip.totalShippedQty, orderRecordsFromJazz: orders.length,
+            jazzOrderStatus: jazzOrder.statuses.join(','), totalOrderedQty: jazzOrder.totalOrderedQty,
+            totalCancelledQty: jazzOrder.totalCancelledQty, distinctToSku: Object.keys(toQtyBySku).length
+        });
+
+        return {
+            toId: toId, wmsOrderNumber: wmsOrderNumber,
             cartons: jazzShip.cartons, shippedQtyBySku: jazzShip.shippedQtyBySku,
             totalShippedQty: jazzShip.totalShippedQty,
             cancelledQtyBySku: jazzOrder.cancelledQtyBySku, totalCancelledQty: jazzOrder.totalCancelledQty,
@@ -50,67 +327,70 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
             primaryShipmentNumber: jazzShip.primaryShipmentNumber,
             earliestShipDate: jazzShip.earliestShipDate
         };
-
-        log.audit('INPUT SUMMARY', {
-            shipmentsFromJazz: shipments.length, cartonsFound: jazzShip.cartons.length,
-            distinctShippedSku: Object.keys(jazzShip.shippedQtyBySku).length,
-            totalShippedQty: jazzShip.totalShippedQty, orderRecordsFromJazz: orders.length,
-            jazzOrderStatus: row.jazzOrderStatus, totalOrderedQty: jazzOrder.totalOrderedQty,
-            distinctCancelSku: Object.keys(jazzOrder.cancelledQtyBySku).length,
-            totalCancelledQty: jazzOrder.totalCancelledQty, distinctToSku: Object.keys(toQtyBySku).length
-        });
-
-        return [row]; // one row -> one map -> at most one IF
     }
 
-    /* ================= MAP ================= */
+    /* ================= MODE 2 - RECEIPT (one IR per Item Fulfillment) ================= */
 
-    function map(context) {
-        var row = JSON.parse(context.value);
+    function handleReceipt(payload) {
+        var outcome = { status: 'SKIPPED', success: false, mode: MODE_RECEIPT,
+            toId: payload.toId, tranid: payload.tranid, wmsOrderNumber: payload.wmsOrderNumber,
+            itemFulfillmentId: payload.itemFulfillmentId, ifTranid: payload.ifTranid,
+            itemReceiptId: '', lineCount: 0, receivedLineCount: 0, receivedQtyTotal: 0, message: '' };
 
+        var irRec = record.transform({
+            fromType: record.Type.TRANSFER_ORDER,
+            fromId: payload.toId,
+            toType: record.Type.ITEM_RECEIPT,
+            isDynamic: false,
+            defaultValues: { itemfulfillment: payload.itemFulfillmentId }
+        });
+
+        outcome.lineCount = irRec.getLineCount({ sublistId: 'item' });
+
+        if (outcome.lineCount <= 0) {
+            outcome.message = 'Skipped - transform returned 0 lines. This fulfillment has already been ' +
+                'received or has nothing in transit.';
+            return outcome;
+        }
+
+        // Count what is actually being received. If everything is zero / unticked, this IF is done.
+        for (var line = 0; line < outcome.lineCount; line++) {
+            var receiving = irRec.getSublistValue({ sublistId: 'item', fieldId: 'itemreceive', line: line });
+            var qty = Number(irRec.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: line }) || 0);
+
+            if (receiving && qty > 0) { outcome.receivedLineCount++; outcome.receivedQtyTotal += qty; }
+        }
+
+        if (outcome.receivedQtyTotal <= 0) {
+            outcome.message = 'Skipped - nothing outstanding to receive on this fulfillment.';
+            return outcome;
+        }
+
+        if (payload.wmsOrderNumber) trySet(irRec, BODY_WMS_ORDER_NUMBER, payload.wmsOrderNumber);
+
+        var memo = getFulfillmentMemo(payload.itemFulfillmentId);
+        if (memo) trySet(irRec, 'memo', memo);
+
+        outcome.itemReceiptId = irRec.save({ enableSourcing: false, ignoreMandatoryFields: true });
+        outcome.success = true;
+        outcome.status = 'IR_CREATED';
+        outcome.message = 'Item Receipt created for fulfillment ' + (payload.ifTranid || payload.itemFulfillmentId) + '.';
+
+        return outcome;
+    }
+
+    /** Carry the reconciliation memo written on the IF across to its receipt. */
+    function getFulfillmentMemo(ifId) {
         try {
-            if (!row.cartons || !row.cartons.length) {
-                log.audit('SKIP - NO CARTONS', { wmsOrderNumber: row.wmsOrderNumber });
-                return context.write({ key: 'SKIPPED', value: JSON.stringify({
-                    reason: 'No eligible cartons found in Jazz for this WMS order.',
-                    wmsOrderNumber: row.wmsOrderNumber }) });
-            }
-
-            var existing = findExistingItemFulfillment(row.toId, row.wmsOrderNumber);
-
-            if (existing.found) {
-                log.audit('SKIP - IF ALREADY EXISTS', existing);
-                return context.write({ key: 'DUPLICATE_SKIPPED', value: JSON.stringify({
-                    wmsOrderNumber: row.wmsOrderNumber, existingItemFulfillmentId: existing.id,
-                    existingTranId: existing.tranid }) });
-            }
-
-            var result = createConsolidatedFulfillment(row);
-            log.audit('FULFILLMENT RESULT', result);
-
-            if (!result.success) return context.write({ key: 'SKIPPED', value: JSON.stringify(result) });
-
-            var receipt = createConsolidatedItemReceipt(row, result.itemFulfillmentId, result.memo);
-            log.audit('ITEM RECEIPT RESULT', receipt);
-
-            result.itemReceiptId = receipt.itemReceiptId;
-            result.itemReceiptMessage = receipt.message;
-
-            if (!receipt.success) log.error('ITEM RECEIPT FAILED - IF ALREADY CREATED', {
-                wmsOrderNumber: row.wmsOrderNumber, itemFulfillmentId: result.itemFulfillmentId,
-                reason: receipt.message });
-
-            context.write({ key: receipt.success ? 'CREATED' : 'CREATED_IF_ONLY_RECEIPT_FAILED',
-                value: JSON.stringify(result) });
-
+            return search.lookupFields({ type: search.Type.ITEM_FULFILLMENT, id: ifId,
+                columns: ['memo'] }).memo || '';
         } catch (e) {
-            log.error('MAP ERROR', { wmsOrderNumber: row.wmsOrderNumber, message: e.message, stack: e.stack });
-            context.write({ key: 'ERROR', value: JSON.stringify({
-                wmsOrderNumber: row.wmsOrderNumber, message: e.message }) });
+            log.debug('memo lookup failed', { ifId: ifId, message: e.message });
+            return '';
         }
     }
 
-    /* ================= ITEM FULFILLMENT ================= */
+    /* ================= ITEM FULFILLMENT BUILDER ================= */
 
     function createConsolidatedFulfillment(row) {
         var result = {
@@ -314,43 +594,6 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
         return { text: text, truncated: truncated };
     }
 
-    /* ================= ITEM RECEIPT (TO -> ItemRecpt; IF -> ItemRecpt is unsupported) ================= */
-
-    function createConsolidatedItemReceipt(row, itemFulfillmentId, memo) {
-        var result = { success: false, itemReceiptId: '', lineCount: 0, message: '' };
-
-        if (!row || !row.toId) { result.message = 'Skipped - no Transfer Order ID.'; return result; }
-
-        try {
-            var irRec = record.transform({ fromType: record.Type.TRANSFER_ORDER, fromId: row.toId,
-                toType: record.Type.ITEM_RECEIPT, isDynamic: false });
-
-            result.lineCount = irRec.getLineCount({ sublistId: 'item' });
-
-            if (result.lineCount <= 0) {
-                result.message = 'Skipped - transformed Item Receipt has 0 lines. ' +
-                    'Nothing outstanding to receive - confirm the IF saved with quantities.';
-                log.error('ITEM RECEIPT - NO LINES AFTER TRANSFORM', { toId: row.toId,
-                    itemFulfillmentId: itemFulfillmentId, wmsOrderNumber: row.wmsOrderNumber });
-                return result;
-            }
-
-            trySet(irRec, BODY_WMS_ORDER_NUMBER, row.wmsOrderNumber);
-            if (memo) trySet(irRec, 'memo', memo);
-
-            result.itemReceiptId = irRec.save({ enableSourcing: false, ignoreMandatoryFields: true });
-            result.success = true;
-            result.message = 'Consolidated Item Receipt created from the Transfer Order.';
-
-        } catch (e) {
-            log.error('ITEM RECEIPT CREATE FAILED', { toId: row.toId, itemFulfillmentId: itemFulfillmentId,
-                wmsOrderNumber: row.wmsOrderNumber, message: e.message, stack: e.stack });
-            result.message = 'Error creating Item Receipt: ' + e.message;
-        }
-
-        return result;
-    }
-
     /* ================= TO QUANTITY SEARCH ================= */
 
     function getToQtyBySku(toId) {
@@ -414,11 +657,13 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
 
     /* ================= JAZZ API ================= */
 
-    function getJazzToken() {
+    function getJazzToken(cfg) {
+        if (_tokenCache) return _tokenCache;
+
         var resp = https.post({
             url: 'https://' + CONFIG.JAZZ_DOMAIN + '/api/token/',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({ username: CONFIG.JAZZ_USERNAME, password: CONFIG.JAZZ_PASSWORD })
+            body: JSON.stringify({ username: CONFIG.JAZZ_USERNAME, password: cfg.jazzPassword })
         });
 
         if (Number(resp.code) < 200 || Number(resp.code) >= 300)
@@ -429,6 +674,7 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
 
         if (!token) throw new Error('Jazz token missing from response.');
 
+        _tokenCache = token;
         return token;
     }
 
@@ -689,15 +935,16 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
     function findExistingItemFulfillment(toId, wmsOrderNumber) {
         var out = { found: false, id: '', tranid: '' };
 
-        if (!wmsOrderNumber) return out;
+        var filters = [
+            ['type', 'anyof', 'ItemShip'], 'AND', ['mainline', 'is', 'T'], 'AND',
+            ['createdfrom', 'anyof', String(toId)]
+        ];
+
+        if (wmsOrderNumber) filters.push('AND', [BODY_WMS_ORDER_NUMBER, 'is', String(wmsOrderNumber)]);
 
         search.create({
             type: 'itemfulfillment',
-            filters: [
-                ['type', 'anyof', 'ItemShip'], 'AND', ['mainline', 'is', 'T'], 'AND',
-                ['createdfrom', 'anyof', String(toId)], 'AND',
-                [BODY_WMS_ORDER_NUMBER, 'is', String(wmsOrderNumber)]
-            ],
+            filters: filters,
             columns: [search.createColumn({ name: 'internalid' }), search.createColumn({ name: 'tranid' })]
         }).run().each(function (r) {
             out.found = true;
@@ -814,27 +1061,68 @@ define(['N/https', 'N/record', 'N/log', 'N/search'], function (https, record, lo
     /* ================= SUMMARIZE ================= */
 
     function summarize(summary) {
-        var counts = { CREATED: 0, CREATED_IF_ONLY_RECEIPT_FAILED: 0, SKIPPED: 0,
-            DUPLICATE_SKIPPED: 0, ERROR: 0 };
+        var cfg = getDeploymentConfig();
+        var counts = { IF_CREATED: 0, IR_CREATED: 0, SKIPPED: 0, DUPLICATE_SKIPPED: 0, ERROR: 0 };
+        var toState = {};   // toId -> { ok: bool }
 
         summary.output.iterator().each(function (key, value) {
             if (counts.hasOwnProperty(key)) counts[key]++;
+
             log.audit('OUTPUT ' + key, value);
+
+            try {
+                var row = JSON.parse(value);
+                if (row && row.toId) {
+                    if (!toState[row.toId]) toState[row.toId] = { ok: true };
+                    if (key === 'ERROR') toState[row.toId].ok = false;
+                }
+            } catch (e) { /* keep going */ }
+
             return true;
         });
 
-        log.audit('SCRIPT COMPLETED', { usage: summary.usage, concurrency: summary.concurrency,
-            yields: summary.yields, counts: counts });
+        // Untick the trigger checkbox, but only for TOs where nothing errored.
+        // A TO that half-failed keeps its checkbox so the next run picks up the remainder.
+        if (cfg.mode === MODE_RECEIPT && cfg.clearField) {
+            var cleared = 0, kept = 0;
 
-        if (counts.CREATED_IF_ONLY_RECEIPT_FAILED > 0)
-            log.error('ATTENTION - IF CREATED WITHOUT A RECEIPT', { count: counts.CREATED_IF_ONLY_RECEIPT_FAILED,
-                note: 'See ITEM RECEIPT FAILED entries above. Create the receipt manually.' });
+            for (var toId in toState) {
+                if (!toState.hasOwnProperty(toId)) continue;
+
+                if (!toState[toId].ok) { kept++; continue; }
+
+                try {
+                    var values = {};
+                    values[cfg.clearField] = false;
+                    record.submitFields({ type: record.Type.TRANSFER_ORDER, id: toId, values: values,
+                        options: { enableSourcing: false, ignoreMandatoryFields: true } });
+                    cleared++;
+                } catch (e) {
+                    log.error('CLEAR CHECKBOX FAILED', { toId: toId, field: cfg.clearField, message: e.message });
+                }
+            }
+
+            log.audit('CHECKBOX CLEARED', { cleared: cleared, keptForRetry: kept, field: cfg.clearField });
+        }
+
+        log.audit('SCRIPT COMPLETED', { mode: cfg.mode, searchId: cfg.searchId,
+            distinctTransferOrders: Object.keys(toState).length, usage: summary.usage,
+            concurrency: summary.concurrency, yields: summary.yields, counts: counts });
+
+        if (counts.ERROR > 0)
+            log.error('ATTENTION - ERRORS DURING RUN', { mode: cfg.mode, count: counts.ERROR,
+                note: 'See REDUCE ERROR entries above. Affected TOs kept their checkbox for retry.' });
 
         summary.mapSummary.errors.iterator().each(function (key, error) {
             log.error('MAP SUMMARY ERROR ' + key, error);
             return true;
         });
+
+        summary.reduceSummary.errors.iterator().each(function (key, error) {
+            log.error('REDUCE SUMMARY ERROR ' + key, error);
+            return true;
+        });
     }
 
-    return { getInputData: getInputData, map: map, summarize: summarize };
+    return { getInputData: getInputData, map: map, reduce: reduce, summarize: summarize };
 });
