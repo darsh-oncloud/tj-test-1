@@ -56,8 +56,8 @@ function (https, record, log, search, runtime, format) {
     /* ================= CONFIG ================= */
 
     var CONFIG = {
-        JAZZ_DOMAIN: 'fbflurry.jazz-oms.com',
-        JAZZ_USERNAME: 'Dsoni',
+        JAZZ_DOMAIN: 'fbflurry-uat01.jazz-oms.com',
+        JAZZ_USERNAME: 'dsoni',
         JAZZ_PASSWORD: '',              // leave blank - supply via custscript_jz_password
         JAZZ_TENANT: 'TMJ',
         JAZZ_PAGE_LIMIT: 900,
